@@ -8,4 +8,6 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 iroh = "0.96.1"
 rand = "0.9"
+serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "signal"] }
+toml = "0.8"

@@ -28,7 +28,7 @@ iroh-proxy [--key-file <path>] <command>
 
 ### `serve`
 
-Expose a local TCP target under a named iroh service.
+Expose one local TCP target under a named iroh service.
 
 ```bash
 iroh-proxy serve --name <service-name> <target-host:port>
@@ -40,47 +40,101 @@ Example:
 iroh-proxy serve --name ollama localhost:11434
 ```
 
-This prints an endpoint id and serves the path:
+### `serve-config`
 
-```text
-<endpoint-id>/tcp/ollama
+Expose multiple local TCP targets from `config.toml`.
+
+```bash
+iroh-proxy serve-config ./config.toml
 ```
 
 ### `forward`
 
-Bind a local TCP listener and forward to a remote iroh service path.
+Forward to a remote iroh service path in two modes.
 
 ```bash
+iroh-proxy forward <endpoint-id>/tcp/<service-name>
 iroh-proxy forward <listen-host:port> <endpoint-id>/tcp/<service-name>
 ```
 
-Example:
+Examples:
 
 ```bash
+# stdio mode (for ssh ProxyCommand)
+iroh-proxy forward <endpoint-id>/tcp/ssh
+
+# local listener mode
 iroh-proxy forward 127.0.0.1:11435 <endpoint-id>/tcp/ollama
 ```
 
-Now clients can use `127.0.0.1:11435` as if the service were local.
+SSH example:
 
-## End-to-end example (Ollama)
+```sshconfig
+Host gpu-iroh
+    HostName ignored
+    User your-user
+    ProxyCommand iroh-proxy forward 74f3645e8016bb34970c516acde5240e85ed4387dbe3aeb9189f50db5525bd76/tcp/ssh
+```
+
+### `forward-config`
+
+Bind multiple local listeners from `config.toml`.
+
+```bash
+iroh-proxy forward-config ./config.toml
+```
+
+## Config file
+
+See `config.example.toml`.
+
+```toml
+[serve]
+[[serve.services]]
+name = "ollama"
+target = "localhost:11434"
+
+[[serve.services]]
+name = "vllm"
+target = "localhost:8000"
+
+[forward]
+[[forward.services]]
+listen = "127.0.0.1:11435"
+remote = "<endpoint-id>/tcp/ollama"
+
+[[forward.services]]
+listen = "127.0.0.1:18000"
+remote = "<endpoint-id>/tcp/vllm"
+```
+
+You can include only the section needed by the command you run:
+
+- `serve-config` requires `[serve]`
+- `forward-config` requires `[forward]`
+
+## End-to-end example (multi-service)
 
 On GPU machine:
 
 ```bash
-iroh-proxy serve --name ollama localhost:11434
+iroh-proxy serve-config ./config.toml
 ```
 
-On client machine:
-
-```bash
-iroh-proxy forward 127.0.0.1:11435 <endpoint-id>/tcp/ollama
-```
-
-Then call Ollama via:
+The process prints the endpoint id and all exported service paths:
 
 ```text
-http://127.0.0.1:11435
+<endpoint-id>/tcp/ollama
+<endpoint-id>/tcp/vllm
 ```
+
+On client machine, put that endpoint id into `config.toml`, then run:
+
+```bash
+iroh-proxy forward-config ./config.toml
+```
+
+Now local clients can use each configured listener as if remote services were local.
 
 ## Keys and identity
 
@@ -98,8 +152,8 @@ http://127.0.0.1:11435
 ## Development
 
 ```bash
+cargo fmt
 cargo check
-cargo test
 cargo run -- --help
 ```
 

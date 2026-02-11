@@ -1,10 +1,13 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
 use iroh::{Endpoint, EndpointId, SecretKey};
-use tokio::io;
+use serde::Deserialize;
+use tokio::io::{self, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 #[derive(Debug, Parser)]
@@ -31,13 +34,28 @@ enum Commands {
         target: String,
     },
 
-    /// Forward a local TCP listener to a remote iroh endpoint path
-    Forward {
-        /// Local bind address, e.g. 127.0.0.1:11435
-        listen: String,
+    /// Serve multiple local TCP services from a TOML config file
+    ServeConfig {
+        /// Path to config.toml
+        config: PathBuf,
+    },
 
-        /// Remote path in form: <node-id>/tcp/<name>
-        remote: String,
+    /// Forward to a remote iroh endpoint path.
+    ///
+    /// - One arg: stdio mode (useful for ssh ProxyCommand)
+    /// - Two args: listen mode (<listen> <remote>)
+    Forward {
+        /// Remote path in form: <node-id>/tcp/<name> OR local bind when providing two args
+        first: String,
+
+        /// Remote path in form: <node-id>/tcp/<name> (only required for listen mode)
+        second: Option<String>,
+    },
+
+    /// Forward multiple local listeners from a TOML config file
+    ForwardConfig {
+        /// Path to config.toml
+        config: PathBuf,
     },
 }
 
@@ -79,6 +97,46 @@ impl FromStr for RemotePath {
     }
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct ServeService {
+    name: String,
+    target: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ForwardService {
+    listen: String,
+    remote: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct Config {
+    serve: Option<ServeSection>,
+    forward: Option<ForwardSection>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ServeSection {
+    services: Vec<ServeService>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ForwardSection {
+    services: Vec<ForwardService>,
+}
+
+#[derive(Debug, Clone)]
+struct Route {
+    name: String,
+    target: String,
+}
+
+#[derive(Debug, Clone)]
+struct ForwardBinding {
+    listen: String,
+    remote: RemotePath,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -87,31 +145,99 @@ async fn main() -> Result<()> {
     let secret_key = load_or_create_secret_key(&key_path)?;
 
     match cli.command {
-        Commands::Serve { name, target } => serve(secret_key, name, target).await,
-        Commands::Forward { listen, remote } => forward(secret_key, listen, remote).await,
+        Commands::Serve { name, target } => {
+            let services = vec![ServeService { name, target }];
+            serve_services(secret_key, services).await
+        }
+        Commands::ServeConfig { config } => {
+            let cfg = load_config(&config)?;
+            let serve = cfg
+                .serve
+                .ok_or_else(|| anyhow!("missing [serve] section in {}", config.display()))?;
+            serve_services(secret_key, serve.services).await
+        }
+        Commands::Forward { first, second } => match second {
+            Some(remote) => {
+                let bindings = vec![ForwardBinding {
+                    listen: first,
+                    remote: RemotePath::from_str(&remote)?,
+                }];
+                forward_bindings(secret_key, bindings).await
+            }
+            None => {
+                let remote = RemotePath::from_str(&first)?;
+                forward_stdio(secret_key, remote).await
+            }
+        },
+        Commands::ForwardConfig { config } => {
+            let cfg = load_config(&config)?;
+            let forward = cfg
+                .forward
+                .ok_or_else(|| anyhow!("missing [forward] section in {}", config.display()))?;
+
+            let mut bindings = Vec::with_capacity(forward.services.len());
+            for entry in forward.services {
+                bindings.push(ForwardBinding {
+                    listen: entry.listen,
+                    remote: RemotePath::from_str(&entry.remote)
+                        .with_context(|| format!("invalid remote path '{}'", entry.remote))?,
+                });
+            }
+
+            forward_bindings(secret_key, bindings).await
+        }
     }
 }
 
-async fn serve(secret_key: SecretKey, name: String, target: String) -> Result<()> {
-    let alpn = alpn_for_service(&name);
+async fn serve_services(secret_key: SecretKey, services: Vec<ServeService>) -> Result<()> {
+    if services.is_empty() {
+        bail!("at least one service is required");
+    }
+
+    let mut alpns = Vec::with_capacity(services.len());
+    let mut routes = HashMap::<Vec<u8>, Route>::with_capacity(services.len());
+
+    for service in services {
+        if service.name.trim().is_empty() {
+            bail!("service name cannot be empty");
+        }
+
+        let alpn = alpn_for_service(&service.name);
+        if routes.contains_key(&alpn) {
+            bail!("duplicate service name '{}'", service.name);
+        }
+
+        alpns.push(alpn.clone());
+        routes.insert(
+            alpn,
+            Route {
+                name: service.name,
+                target: service.target,
+            },
+        );
+    }
+
     let endpoint = Endpoint::builder()
         .secret_key(secret_key)
-        .alpns(vec![alpn.clone()])
+        .alpns(alpns)
         .bind()
         .await?;
 
     endpoint.online().await;
 
-    eprintln!("Serving {target} as {}/tcp/{name}", endpoint.id());
+    eprintln!("Serving endpoint id: {}", endpoint.id());
     eprintln!("Endpoint address: {:?}", endpoint.addr());
+    for route in routes.values() {
+        eprintln!("- {}/tcp/{} -> {}", endpoint.id(), route.name, route.target);
+    }
 
+    let routes = Arc::new(routes);
     loop {
         let incoming = endpoint.accept().await.context("endpoint closed")?;
-        let target = target.clone();
-        let alpn = alpn.clone();
+        let routes = Arc::clone(&routes);
 
         tokio::spawn(async move {
-            if let Err(err) = handle_incoming(incoming, target, alpn).await {
+            if let Err(err) = handle_incoming(incoming, routes).await {
                 eprintln!("incoming connection error: {err:#}");
             }
         });
@@ -120,24 +246,25 @@ async fn serve(secret_key: SecretKey, name: String, target: String) -> Result<()
 
 async fn handle_incoming(
     incoming: iroh::endpoint::Incoming,
-    target: String,
-    expected_alpn: Vec<u8>,
+    routes: Arc<HashMap<Vec<u8>, Route>>,
 ) -> Result<()> {
     let conn = incoming.await?;
-
     let negotiated = conn.alpn();
-    if negotiated != expected_alpn {
-        bail!(
-            "unexpected ALPN '{}', expected '{}'",
-            String::from_utf8_lossy(negotiated),
-            String::from_utf8_lossy(&expected_alpn)
-        );
-    }
+
+    let route = routes
+        .get(negotiated)
+        .ok_or_else(|| {
+            anyhow!(
+                "unknown service ALPN '{}'",
+                String::from_utf8_lossy(negotiated)
+            )
+        })?
+        .clone();
 
     let (mut send, mut recv) = conn.accept_bi().await?;
-    let local = TcpStream::connect(&target)
+    let local = TcpStream::connect(&route.target)
         .await
-        .with_context(|| format!("failed to connect local target {target}"))?;
+        .with_context(|| format!("failed to connect local target {}", route.target))?;
 
     let (mut local_read, mut local_write) = local.into_split();
 
@@ -149,26 +276,81 @@ async fn handle_incoming(
     Ok(())
 }
 
-async fn forward(secret_key: SecretKey, listen: String, remote: String) -> Result<()> {
-    let remote = RemotePath::from_str(&remote)?;
+async fn forward_stdio(secret_key: SecretKey, remote: RemotePath) -> Result<()> {
     let alpn = alpn_for_service(&remote.service);
+    let endpoint = Endpoint::builder().secret_key(secret_key).bind().await?;
+    endpoint.online().await;
+
+    let conn = endpoint
+        .connect(remote.endpoint_id, &alpn)
+        .await
+        .with_context(|| {
+            format!(
+                "failed connecting to remote endpoint {}",
+                remote.endpoint_id
+            )
+        })?;
+    let (mut send, mut recv) = conn.open_bi().await?;
+
+    let mut stdin = io::stdin();
+    let mut stdout = io::stdout();
+
+    let to_remote = io::copy(&mut stdin, &mut send);
+    let to_local = io::copy(&mut recv, &mut stdout);
+    let _ = tokio::try_join!(to_remote, to_local)?;
+
+    send.finish()?;
+    stdout.flush().await?;
+    Ok(())
+}
+
+async fn forward_bindings(secret_key: SecretKey, bindings: Vec<ForwardBinding>) -> Result<()> {
+    if bindings.is_empty() {
+        bail!("at least one forward binding is required");
+    }
 
     let endpoint = Endpoint::builder().secret_key(secret_key).bind().await?;
     endpoint.online().await;
 
-    let listener = TcpListener::bind(&listen)
-        .await
-        .with_context(|| format!("failed to bind local listener {listen}"))?;
+    let mut prepared = Vec::with_capacity(bindings.len());
+    for binding in bindings {
+        let listener = TcpListener::bind(&binding.listen)
+            .await
+            .with_context(|| format!("failed to bind local listener {}", binding.listen))?;
 
-    eprintln!(
-        "Forwarding {listen} -> {}/tcp/{}",
-        remote.endpoint_id, remote.service
-    );
+        let alpn = alpn_for_service(&binding.remote.service);
+        eprintln!(
+            "Forwarding {} -> {}/tcp/{}",
+            binding.listen, binding.remote.endpoint_id, binding.remote.service
+        );
 
+        prepared.push((listener, binding, alpn));
+    }
+
+    for (listener, binding, alpn) in prepared {
+        let endpoint = endpoint.clone();
+        tokio::spawn(async move {
+            if let Err(err) = run_forward_listener(endpoint, listener, binding, alpn).await {
+                eprintln!("forward listener error: {err:#}");
+            }
+        });
+    }
+
+    std::future::pending::<()>().await;
+    #[allow(unreachable_code)]
+    Ok(())
+}
+
+async fn run_forward_listener(
+    endpoint: Endpoint,
+    listener: TcpListener,
+    binding: ForwardBinding,
+    alpn: Vec<u8>,
+) -> Result<()> {
     loop {
         let (inbound, peer_addr) = listener.accept().await?;
         let endpoint = endpoint.clone();
-        let remote = remote.clone();
+        let remote = binding.remote.clone();
         let alpn = alpn.clone();
 
         tokio::spawn(async move {
@@ -188,7 +370,12 @@ async fn handle_forward_conn(
     let conn = endpoint
         .connect(remote.endpoint_id, &alpn)
         .await
-        .with_context(|| format!("failed connecting to remote endpoint {}", remote.endpoint_id))?;
+        .with_context(|| {
+            format!(
+                "failed connecting to remote endpoint {}",
+                remote.endpoint_id
+            )
+        })?;
 
     let (mut send, mut recv) = conn.open_bi().await?;
 
@@ -200,6 +387,12 @@ async fn handle_forward_conn(
 
     send.finish()?;
     Ok(())
+}
+
+fn load_config(path: &Path) -> Result<Config> {
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read config {}", path.display()))?;
+    toml::from_str(&raw).with_context(|| format!("invalid TOML in {}", path.display()))
 }
 
 fn alpn_for_service(name: &str) -> Vec<u8> {

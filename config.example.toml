@@ -1,0 +1,17 @@
+[serve]
+[[serve.services]]
+name = "ollama"
+target = "localhost:11434"
+
+[[serve.services]]
+name = "vllm"
+target = "localhost:8000"
+
+[forward]
+[[forward.services]]
+listen = "127.0.0.1:11435"
+remote = "<endpoint-id>/tcp/ollama"
+
+[[forward.services]]
+listen = "127.0.0.1:18000"
+remote = "<endpoint-id>/tcp/vllm"
