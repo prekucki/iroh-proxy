@@ -7,7 +7,7 @@ use crate::remote_path::RemotePath;
 
 #[derive(Debug, Clone)]
 pub struct ForwardBinding {
-    pub listen: String,
+    pub listen: Box<str>,
     pub remote: RemotePath,
 }
 
@@ -49,7 +49,7 @@ pub async fn forward_bindings(secret_key: SecretKey, bindings: Vec<ForwardBindin
 
     let mut prepared = Vec::with_capacity(bindings.len());
     for binding in bindings {
-        let listener = TcpListener::bind(&binding.listen)
+        let listener = TcpListener::bind(&*binding.listen)
             .await
             .with_context(|| format!("failed to bind local listener {}", binding.listen))?;
 

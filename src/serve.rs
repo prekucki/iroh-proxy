@@ -11,8 +11,8 @@ use crate::remote_path::service_to_alpn;
 
 #[derive(Debug, Clone)]
 struct Route {
-    name: String,
-    target: String,
+    name: Box<str>,
+    target: Box<str>,
 }
 
 pub async fn serve_services(secret_key: SecretKey, services: Vec<ServeService>) -> Result<()> {
@@ -88,7 +88,7 @@ async fn handle_incoming(
         .clone();
 
     let (mut send, mut recv) = conn.accept_bi().await?;
-    let local = TcpStream::connect(&route.target)
+    let local = TcpStream::connect(&*route.target)
         .await
         .with_context(|| format!("failed to connect local target {}", route.target))?;
 

@@ -5,14 +5,14 @@ use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ServeService {
-    pub name: String,
-    pub target: String,
+    pub name: Box<str>,
+    pub target: Box<str>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ForwardService {
-    pub listen: String,
-    pub remote: String,
+    pub listen: Box<str>,
+    pub remote: Box<str>,
 }
 
 #[derive(Debug, Deserialize)]

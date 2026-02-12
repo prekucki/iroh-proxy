@@ -7,11 +7,11 @@ use iroh::EndpointId;
 #[derive(Debug, Clone)]
 pub struct RemotePath {
     pub endpoint_id: EndpointId,
-    pub service: String,
+    pub service: Box<str>,
 }
 
 #[derive(Debug)]
-struct ParseError(String);
+struct ParseError(Box<str>);
 
 impl fmt::Display for ParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -40,34 +40,33 @@ impl FromStr for RemotePath {
         let mut parts = value.split('/');
         let endpoint_raw = parts
             .next()
-            .ok_or_else(|| ParseError("missing endpoint id in remote path".to_string()))?;
+            .ok_or_else(|| ParseError("missing endpoint id in remote path".into()))?;
         let protocol = parts
             .next()
-            .ok_or_else(|| ParseError("missing protocol segment in remote path".to_string()))?;
+            .ok_or_else(|| ParseError("missing protocol segment in remote path".into()))?;
         let service = parts
             .next()
-            .ok_or_else(|| ParseError("missing service segment in remote path".to_string()))?;
+            .ok_or_else(|| ParseError("missing service segment in remote path".into()))?;
 
         if parts.next().is_some() {
             return Err(
-                ParseError("remote path must be exactly <node-id>/tcp/<name>".to_string()).into(),
+                ParseError("remote path must be exactly <node-id>/tcp/<name>".into()).into(),
             );
         }
         if protocol != "tcp" {
-            return Err(
-                ParseError(format!("unsupported protocol '{protocol}', expected 'tcp'")).into(),
-            );
+            return Err(ParseError(
+                format!("unsupported protocol '{protocol}', expected 'tcp'").into(),
+            )
+            .into());
         }
 
         let endpoint_id = EndpointId::from_str(endpoint_raw).map_err(|e| {
-            ParseError(format!(
-                "invalid endpoint id '{endpoint_raw}' in remote path: {e}"
-            ))
+            ParseError(format!("invalid endpoint id '{endpoint_raw}' in remote path: {e}").into())
         })?;
 
         Ok(Self {
             endpoint_id,
-            service: service.to_string(),
+            service: service.into(),
         })
     }
 }

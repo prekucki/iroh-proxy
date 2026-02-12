@@ -26,7 +26,10 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Serve { name, target } => {
-            let services = vec![ServeService { name, target }];
+            let services = vec![ServeService {
+                name: name.into(),
+                target: target.into(),
+            }];
             serve_services(secret_key, services).await
         }
         Commands::ServeConfig { config } => {
@@ -39,7 +42,7 @@ async fn main() -> Result<()> {
         Commands::Forward { first, second } => match second {
             Some(remote) => {
                 let bindings = vec![ForwardBinding {
-                    listen: first,
+                    listen: first.into(),
                     remote: RemotePath::from_str(&remote)?,
                 }];
                 forward_bindings(secret_key, bindings).await
