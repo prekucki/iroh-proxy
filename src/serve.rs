@@ -7,12 +7,15 @@ use tokio::io;
 use tokio::net::TcpStream;
 
 use crate::config::ServeService;
-use crate::remote_path::alpn_for_service;
 
 #[derive(Debug, Clone)]
 struct Route {
     name: String,
     target: String,
+}
+
+fn service_to_alpn(name: &str) -> Vec<u8> {
+    format!("iroh-proxy/tcp/{name}").into_bytes()
 }
 
 pub async fn serve_services(secret_key: SecretKey, services: Vec<ServeService>) -> Result<()> {
@@ -28,7 +31,7 @@ pub async fn serve_services(secret_key: SecretKey, services: Vec<ServeService>) 
             bail!("service name cannot be empty");
         }
 
-        let alpn = alpn_for_service(&service.name);
+        let alpn = service_to_alpn(&service.name);
         if routes.contains_key(&alpn) {
             bail!("duplicate service name '{}'", service.name);
         }

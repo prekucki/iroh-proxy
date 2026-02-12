@@ -3,7 +3,7 @@ use iroh::{Endpoint, SecretKey};
 use tokio::io::{self, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-use crate::remote_path::{RemotePath, alpn_for_service};
+use crate::remote_path::RemotePath;
 
 #[derive(Debug, Clone)]
 pub struct ForwardBinding {
@@ -12,7 +12,7 @@ pub struct ForwardBinding {
 }
 
 pub async fn forward_stdio(secret_key: SecretKey, remote: RemotePath) -> Result<()> {
-    let alpn = alpn_for_service(&remote.service);
+    let alpn = remote.to_alpn();
     let endpoint = Endpoint::builder().secret_key(secret_key).bind().await?;
     endpoint.online().await;
 
@@ -53,7 +53,7 @@ pub async fn forward_bindings(secret_key: SecretKey, bindings: Vec<ForwardBindin
             .await
             .with_context(|| format!("failed to bind local listener {}", binding.listen))?;
 
-        let alpn = alpn_for_service(&binding.remote.service);
+        let alpn = binding.remote.to_alpn();
         eprintln!(
             "Forwarding {} -> {}/tcp/{}",
             binding.listen, binding.remote.endpoint_id, binding.remote.service

@@ -1,14 +1,13 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use directories::ProjectDirs;
 use iroh::SecretKey;
 
 pub fn default_key_path() -> PathBuf {
-    let home = std::env::var_os("HOME").unwrap_or_else(|| ".".into());
-    Path::new(&home)
-        .join(".config")
-        .join("iroh-proxy")
-        .join("secret_key")
+    ProjectDirs::from("", "", "iroh-proxy")
+        .map(|dirs| dirs.config_dir().join("secret_key"))
+        .unwrap_or_else(|| PathBuf::from(".config/iroh-proxy/secret_key"))
 }
 
 pub fn load_or_create_secret_key(path: &Path) -> Result<SecretKey> {
