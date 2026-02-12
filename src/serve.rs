@@ -7,15 +7,12 @@ use tokio::io;
 use tokio::net::TcpStream;
 
 use crate::config::ServeService;
+use crate::remote_path::service_to_alpn;
 
 #[derive(Debug, Clone)]
 struct Route {
     name: String,
     target: String,
-}
-
-fn service_to_alpn(name: &str) -> Vec<u8> {
-    format!("iroh-proxy/tcp/{name}").into_bytes()
 }
 
 pub async fn serve_services(secret_key: SecretKey, services: Vec<ServeService>) -> Result<()> {

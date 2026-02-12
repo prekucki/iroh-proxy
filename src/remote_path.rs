@@ -21,9 +21,15 @@ impl fmt::Display for ParseError {
 
 impl Error for ParseError {}
 
+/// Generate ALPN identifier for a service name
+pub fn service_to_alpn(name: &str) -> Vec<u8> {
+    format!("iroh-proxy/tcp/{name}").into_bytes()
+}
+
 impl RemotePath {
+    /// Generate ALPN identifier for this remote path
     pub fn to_alpn(&self) -> Vec<u8> {
-        format!("iroh-proxy/tcp/{}", self.service).into_bytes()
+        service_to_alpn(&self.service)
     }
 }
 
