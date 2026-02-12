@@ -61,7 +61,7 @@ impl FromStr for RemotePath {
 
         let endpoint_id = EndpointId::from_str(endpoint_raw).map_err(|e| {
             ParseError(format!(
-                "invalid endpoint id in remote path: {endpoint_raw}: {e}"
+                "invalid endpoint id '{endpoint_raw}' in remote path: {e}"
             ))
         })?;
 
