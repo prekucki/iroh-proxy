@@ -143,6 +143,13 @@ Now local clients can use each configured listener as if remote services were lo
 - `forward` and `forward-config` use an ephemeral in-memory key by default (new id each run).
 - Use `--key-file` to force persistent key behavior for any command.
 
+## Discovery
+
+`iroh-proxy` uses discovery through:
+
+- local mDNS (LAN discovery)
+- pkarr (relay + DHT)
+
 ## Notes and limits
 
 - Supports only TCP forwarding paths in the form `<endpoint-id>/tcp/<name>`.

@@ -1,5 +1,8 @@
 use anyhow::{Context, Result, bail};
-use iroh::{Endpoint, SecretKey};
+use iroh::{
+    Endpoint, RelayMode, SecretKey,
+    address_lookup::{DhtAddressLookup, MdnsAddressLookup},
+};
 use tokio::io::{self, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -11,17 +14,31 @@ pub struct ForwardBinding {
     pub remote: RemotePath,
 }
 
+async fn build_forward_endpoint(secret_key: SecretKey) -> Result<Endpoint> {
+    let endpoint = Endpoint::empty_builder(RelayMode::Default)
+        .secret_key(secret_key)
+        .address_lookup(
+            DhtAddressLookup::builder()
+                .n0_dns_pkarr_relay()
+                .no_publish(),
+        )
+        .address_lookup(MdnsAddressLookup::builder().advertise(false))
+        .bind()
+        .await?;
+    endpoint.online().await;
+    Ok(endpoint)
+}
+
 pub async fn forward_stdio(secret_key: SecretKey, remote: RemotePath) -> Result<()> {
     let alpn = remote.to_alpn();
-    let endpoint = Endpoint::builder().secret_key(secret_key).bind().await?;
-    endpoint.online().await;
+    let endpoint = build_forward_endpoint(secret_key).await?;
 
     let conn = endpoint
         .connect(remote.endpoint_id, &alpn)
         .await
         .with_context(|| {
             format!(
-                "failed connecting to remote endpoint {}",
+                "failed connecting to remote endpoint {} (discovery failed via local mDNS and pkarr)",
                 remote.endpoint_id
             )
         })?;
@@ -44,8 +61,7 @@ pub async fn forward_bindings(secret_key: SecretKey, bindings: Vec<ForwardBindin
         bail!("at least one forward binding is required");
     }
 
-    let endpoint = Endpoint::builder().secret_key(secret_key).bind().await?;
-    endpoint.online().await;
+    let endpoint = build_forward_endpoint(secret_key).await?;
 
     let mut prepared = Vec::with_capacity(bindings.len());
     for binding in bindings {
@@ -107,7 +123,7 @@ async fn handle_forward_conn(
         .await
         .with_context(|| {
             format!(
-                "failed connecting to remote endpoint {}",
+                "failed connecting to remote endpoint {} (discovery failed via local mDNS and pkarr)",
                 remote.endpoint_id
             )
         })?;

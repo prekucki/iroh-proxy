@@ -7,7 +7,7 @@ edition = "2024"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 directories = "5"
-iroh = "0.96.1"
+iroh = { version = "0.96.1", features = ["address-lookup-mdns", "address-lookup-pkarr-dht"] }
 rand = "0.9"
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "signal"] }

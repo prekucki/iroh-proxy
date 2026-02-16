@@ -2,7 +2,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
-use iroh::{Endpoint, SecretKey};
+use iroh::{
+    Endpoint, RelayMode, SecretKey,
+    address_lookup::{DhtAddressLookup, MdnsAddressLookup},
+};
 use tokio::io;
 use tokio::net::TcpStream;
 
@@ -43,9 +46,11 @@ pub async fn serve_services(secret_key: SecretKey, services: Vec<ServeService>) 
         );
     }
 
-    let endpoint = Endpoint::builder()
+    let endpoint = Endpoint::empty_builder(RelayMode::Default)
         .secret_key(secret_key)
         .alpns(alpns)
+        .address_lookup(DhtAddressLookup::builder().n0_dns_pkarr_relay())
+        .address_lookup(MdnsAddressLookup::builder())
         .bind()
         .await?;
 
