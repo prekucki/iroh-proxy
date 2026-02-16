@@ -141,15 +141,14 @@ struct ForwardBinding {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    let key_path = cli.key_file.unwrap_or_else(default_key_path);
-    let secret_key = load_or_create_secret_key(&key_path)?;
-
     match cli.command {
         Commands::Serve { name, target } => {
+            let secret_key = load_or_create_serve_key(cli.key_file.as_deref())?;
             let services = vec![ServeService { name, target }];
             serve_services(secret_key, services).await
         }
         Commands::ServeConfig { config } => {
+            let secret_key = load_or_create_serve_key(cli.key_file.as_deref())?;
             let cfg = load_config(&config)?;
             let serve = cfg
                 .serve
@@ -158,6 +157,7 @@ async fn main() -> Result<()> {
         }
         Commands::Forward { first, second } => match second {
             Some(remote) => {
+                let secret_key = load_or_create_forward_key(cli.key_file.as_deref())?;
                 let bindings = vec![ForwardBinding {
                     listen: first,
                     remote: RemotePath::from_str(&remote)?,
@@ -165,11 +165,13 @@ async fn main() -> Result<()> {
                 forward_bindings(secret_key, bindings).await
             }
             None => {
+                let secret_key = load_or_create_forward_key(cli.key_file.as_deref())?;
                 let remote = RemotePath::from_str(&first)?;
                 forward_stdio(secret_key, remote).await
             }
         },
         Commands::ForwardConfig { config } => {
+            let secret_key = load_or_create_forward_key(cli.key_file.as_deref())?;
             let cfg = load_config(&config)?;
             let forward = cfg
                 .forward
@@ -405,6 +407,22 @@ fn default_key_path() -> PathBuf {
         .join(".config")
         .join("iroh-proxy")
         .join("secret_key")
+}
+
+fn load_or_create_serve_key(key_file: Option<&Path>) -> Result<SecretKey> {
+    if let Some(path) = key_file {
+        return load_or_create_secret_key(path);
+    }
+    let default = default_key_path();
+    load_or_create_secret_key(&default)
+}
+
+fn load_or_create_forward_key(key_file: Option<&Path>) -> Result<SecretKey> {
+    if let Some(path) = key_file {
+        return load_or_create_secret_key(path);
+    }
+    let mut rng = rand::rng();
+    Ok(SecretKey::generate(&mut rng))
 }
 
 fn load_or_create_secret_key(path: &Path) -> Result<SecretKey> {

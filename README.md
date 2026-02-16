@@ -138,10 +138,10 @@ Now local clients can use each configured listener as if remote services were lo
 
 ## Keys and identity
 
-- By default, a persistent iroh secret key is stored at:
+- `serve` and `serve-config` use a persistent key by default:
   - `~/.config/iroh-proxy/secret_key`
-- Use `--key-file` to override.
-- Keeping the same key keeps the same endpoint id.
+- `forward` and `forward-config` use an ephemeral in-memory key by default (new id each run).
+- Use `--key-file` to force persistent key behavior for any command.
 
 ## Notes and limits
 
