@@ -40,6 +40,77 @@ Example:
 iroh-proxy serve --name ollama localhost:11434
 ```
 
+### `server`
+
+Run the long-lived proxy server that exposes a DBus control API.
+
+```bash
+iroh-proxy server
+```
+
+### `status`
+
+Check whether the live proxy server is running and show current counts.
+
+```bash
+iroh-proxy status
+iroh-proxy status --connections
+```
+
+### `tui`
+
+Open a simple terminal UI for live server inspection.
+
+```bash
+iroh-proxy tui
+```
+
+In the TUI:
+- option `1` shows server status
+- option `2` lists active connections with `src`, `type`, and `dst`
+
+### `add-forward`
+
+Add a local forward rule to the running proxy server.
+
+```bash
+iroh-proxy add-forward <listen-host:port> <endpoint-id>/tcp/<service-name>
+```
+
+Example:
+
+```bash
+iroh-proxy add-forward 127.0.0.1:5050 74f3645e8016bb34970c516acde5240e85ed4387dbe3aeb9189f50db5525bd76/tcp/app
+```
+
+### `add-serve`
+
+Add a served TCP service route to the running proxy server.
+
+```bash
+iroh-proxy add-serve <service-name> <target-host:port>
+```
+
+Example:
+
+```bash
+iroh-proxy add-serve app localhost:5050
+```
+
+### `del-serve`
+
+Remove a served TCP service route from the running proxy server.
+
+```bash
+iroh-proxy del-serve <service-name>
+```
+
+Example:
+
+```bash
+iroh-proxy del-serve app
+```
+
 ### `serve-config`
 
 Expose multiple local TCP targets from `config.toml`.
