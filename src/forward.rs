@@ -3,10 +3,23 @@ use iroh::{
     Endpoint, RelayMode, SecretKey,
     address_lookup::{DhtAddressLookup, MdnsAddressLookup},
 };
+use std::io::ErrorKind;
 use tokio::io::{self, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tracing::{info, warn};
 
 use crate::remote_path::RemotePath;
+
+fn is_disconnect(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        ErrorKind::BrokenPipe
+            | ErrorKind::ConnectionReset
+            | ErrorKind::ConnectionAborted
+            | ErrorKind::UnexpectedEof
+            | ErrorKind::NotConnected
+    )
+}
 
 #[derive(Debug, Clone)]
 pub struct ForwardBinding {
@@ -47,12 +60,43 @@ pub async fn forward_stdio(secret_key: SecretKey, remote: RemotePath) -> Result<
     let mut stdin = io::stdin();
     let mut stdout = io::stdout();
 
-    let to_remote = io::copy(&mut stdin, &mut send);
-    let to_local = io::copy(&mut recv, &mut stdout);
-    let _ = tokio::try_join!(to_remote, to_local)?;
+    let stdin_to_remote = async {
+        match io::copy(&mut stdin, &mut send).await {
+            Ok(bytes) => info!(bytes, "forward stdio stdin->iroh reached EOF"),
+            Err(err) => {
+                if is_disconnect(&err) {
+                    warn!(error = %err, "forward stdio stdin->iroh disconnected");
+                } else {
+                    warn!(error = %err, "forward stdio stdin->iroh copy failed");
+                }
+                return Err(err.into());
+            }
+        }
+        if let Err(err) = send.finish() {
+            warn!(error = %err, "forward stdio failed to half-close iroh send stream");
+        } else {
+            info!("forward stdio half-closed iroh send stream");
+        }
+        Ok::<(), anyhow::Error>(())
+    };
+    let remote_to_stdout = async {
+        match io::copy(&mut recv, &mut stdout).await {
+            Ok(bytes) => info!(bytes, "forward stdio iroh->stdout reached EOF"),
+            Err(err) => {
+                if is_disconnect(&err) {
+                    warn!(error = %err, "forward stdio iroh->stdout disconnected");
+                } else {
+                    warn!(error = %err, "forward stdio iroh->stdout copy failed");
+                }
+                return Err(err.into());
+            }
+        }
+        stdout.flush().await?;
+        Ok::<(), anyhow::Error>(())
+    };
 
-    send.finish()?;
-    stdout.flush().await?;
+    let _ = tokio::try_join!(stdin_to_remote, remote_to_stdout)?;
+
     Ok(())
 }
 
@@ -132,10 +176,49 @@ async fn handle_forward_conn(
 
     let (mut inbound_read, mut inbound_write) = inbound.into_split();
 
-    let to_remote = io::copy(&mut inbound_read, &mut send);
-    let to_local = io::copy(&mut recv, &mut inbound_write);
-    let _ = tokio::try_join!(to_remote, to_local)?;
+    let inbound_to_remote = async {
+        match io::copy(&mut inbound_read, &mut send).await {
+            Ok(bytes) => info!(
+                bytes,
+                "forward tcp->iroh reached EOF (client half-closed or disconnected)"
+            ),
+            Err(err) => {
+                if is_disconnect(&err) {
+                    warn!(error = %err, "forward tcp->iroh disconnected");
+                } else {
+                    warn!(error = %err, "forward tcp->iroh copy failed");
+                }
+                return Err(err.into());
+            }
+        }
+        if let Err(err) = send.finish() {
+            warn!(error = %err, "forward failed to half-close iroh send stream");
+        } else {
+            info!("forward half-closed iroh send stream after tcp EOF");
+        }
+        Ok::<(), anyhow::Error>(())
+    };
+    let remote_to_inbound = async {
+        match io::copy(&mut recv, &mut inbound_write).await {
+            Ok(bytes) => info!(
+                bytes,
+                "forward iroh->tcp reached EOF (remote half-closed or disconnected)"
+            ),
+            Err(err) => {
+                if is_disconnect(&err) {
+                    warn!(error = %err, "forward iroh->tcp disconnected");
+                } else {
+                    warn!(error = %err, "forward iroh->tcp copy failed");
+                }
+                return Err(err.into());
+            }
+        }
+        inbound_write.shutdown().await?;
+        info!("forward half-closed local tcp write after iroh EOF");
+        Ok::<(), anyhow::Error>(())
+    };
 
-    send.finish()?;
+    let _ = tokio::try_join!(inbound_to_remote, remote_to_inbound)?;
+
     Ok(())
 }

@@ -6,11 +6,24 @@ use iroh::{
     Endpoint, RelayMode, SecretKey,
     address_lookup::{DhtAddressLookup, MdnsAddressLookup},
 };
-use tokio::io;
+use std::io::ErrorKind;
+use tokio::io::{self, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tracing::{info, warn};
 
 use crate::config::ServeService;
 use crate::remote_path::service_to_alpn;
+
+fn is_disconnect(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        ErrorKind::BrokenPipe
+            | ErrorKind::ConnectionReset
+            | ErrorKind::ConnectionAborted
+            | ErrorKind::UnexpectedEof
+            | ErrorKind::NotConnected
+    )
+}
 
 #[derive(Debug, Clone)]
 struct Route {
@@ -99,10 +112,47 @@ async fn handle_incoming(
 
     let (mut local_read, mut local_write) = local.into_split();
 
-    let to_local = io::copy(&mut recv, &mut local_write);
-    let to_remote = io::copy(&mut local_read, &mut send);
-    let _ = tokio::try_join!(to_local, to_remote)?;
+    let remote_to_local = async {
+        match io::copy(&mut recv, &mut local_write).await {
+            Ok(bytes) => {
+                info!(bytes, service = %route.name, "serve iroh->tcp reached EOF (client half-closed or disconnected)")
+            }
+            Err(err) => {
+                if is_disconnect(&err) {
+                    warn!(error = %err, service = %route.name, "serve iroh->tcp disconnected");
+                } else {
+                    warn!(error = %err, service = %route.name, "serve iroh->tcp copy failed");
+                }
+                return Err(err.into());
+            }
+        }
+        local_write.shutdown().await?;
+        info!(service = %route.name, "serve half-closed local tcp write after iroh EOF");
+        Ok::<(), anyhow::Error>(())
+    };
+    let local_to_remote = async {
+        match io::copy(&mut local_read, &mut send).await {
+            Ok(bytes) => {
+                info!(bytes, service = %route.name, "serve tcp->iroh reached EOF (target half-closed or disconnected)")
+            }
+            Err(err) => {
+                if is_disconnect(&err) {
+                    warn!(error = %err, service = %route.name, "serve tcp->iroh disconnected");
+                } else {
+                    warn!(error = %err, service = %route.name, "serve tcp->iroh copy failed");
+                }
+                return Err(err.into());
+            }
+        }
+        if let Err(err) = send.finish() {
+            warn!(error = %err, service = %route.name, "serve failed to half-close iroh send stream");
+        } else {
+            info!(service = %route.name, "serve half-closed iroh send stream after tcp EOF");
+        }
+        Ok::<(), anyhow::Error>(())
+    };
 
-    send.finish()?;
+    let _ = tokio::try_join!(remote_to_local, local_to_remote)?;
+
     Ok(())
 }
