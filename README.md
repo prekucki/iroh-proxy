@@ -23,29 +23,36 @@ Binary path:
 ## Commands
 
 ```text
-iroh-proxy [--key-file <path>] <command>
-```
-
-### `serve`
-
-Expose one local TCP target under a named iroh service.
-
-```bash
-iroh-proxy serve --name <service-name> <target-host:port>
-```
-
-Example:
-
-```bash
-iroh-proxy serve --name ollama localhost:11434
+iroh-proxy [--key-file <path>] [--config-file <path>] <command>
 ```
 
 ### `server`
 
 Run the long-lived proxy server that exposes a DBus control API.
 
+`server` loads initial served routes from config (`[serve]`) and persisted forward listeners (`[forward]`).
+
 ```bash
 iroh-proxy server
+```
+
+Install a user systemd unit:
+
+```bash
+iroh-proxy server --install
+```
+
+This writes:
+
+```text
+~/.config/systemd/user/iroh-proxy.service
+```
+
+Then enable it:
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now iroh-proxy.service
 ```
 
 ### `status`
@@ -59,42 +66,52 @@ iroh-proxy status --connections
 
 ### `tui`
 
-Open a simple terminal UI for live server inspection.
+Open a ratatui dashboard for live server inspection and control.
 
 ```bash
 iroh-proxy tui
 ```
 
 In the TUI:
-- option `1` shows server status
-- option `2` lists active connections with `src`, `type`, and `dst`
+- auto layout mode:
+  - full mode at `>=160x36`: always-visible panes for `Services`, `Forwards`, and `Active Connections`
+  - compact mode at `<160` columns or `<36` rows: routes table (`Services`/`Forwards`) stacked above `Connections`
+- event-driven live updates from DBus state signals
+- dialogs to add/remove services and forwards
+- remove-forward mode toggle:
+  - runtime only (suspend listener)
+  - runtime + config (persistent remove)
 
-### `add-forward`
-
-Add a local forward rule to the running proxy server.
-
-```bash
-iroh-proxy add-forward <listen-host:port> <endpoint-id>/tcp/<service-name>
-```
-
-Example:
-
-```bash
-iroh-proxy add-forward 127.0.0.1:5050 74f3645e8016bb34970c516acde5240e85ed4387dbe3aeb9189f50db5525bd76/tcp/app
-```
+Keybinds:
+- full mode: `Tab` / `Shift-Tab` change focused pane
+- compact mode: `Tab` / `Shift-Tab` switch focused row (`Routes`/`Connections`)
+- compact mode: `Left` / `Right` switch routes view (`Services`/`Forwards`)
+- `Up` / `Down`: move selection
+- `a`: add in focused pane
+- `d`: remove selected item
+- `r`: resync snapshot
+- `q`: quit
 
 ### `add-serve`
 
-Add a served TCP service route to the running proxy server.
+Add a served TCP service route to the live proxy server.
+
+If the server is not running, `add-serve` starts it in the background.
 
 ```bash
 iroh-proxy add-serve <service-name> <target-host:port>
 ```
 
+Use `-p` to persist the rule into config (`[serve].services`):
+
+```bash
+iroh-proxy add-serve -p <service-name> <target-host:port>
+```
+
 Example:
 
 ```bash
-iroh-proxy add-serve app localhost:5050
+iroh-proxy add-serve -p ollama localhost:11434
 ```
 
 ### `del-serve`
@@ -108,15 +125,29 @@ iroh-proxy del-serve <service-name>
 Example:
 
 ```bash
-iroh-proxy del-serve app
+iroh-proxy del-serve ollama
 ```
 
-### `serve-config`
+### `add-forward`
 
-Expose multiple local TCP targets from `config.toml`.
+Add a local forward rule to the running proxy server.
+
+If the server is not running, `add-forward` starts it in the background.
 
 ```bash
-iroh-proxy serve-config ./config.toml
+iroh-proxy add-forward <listen-host:port> <endpoint-id>/tcp/<service-name>
+```
+
+Use `-p` to persist the rule into config (`[forward].services`):
+
+```bash
+iroh-proxy add-forward -p <listen-host:port> <endpoint-id>/tcp/<service-name>
+```
+
+Example:
+
+```bash
+iroh-proxy add-forward 127.0.0.1:5050 74f3645e8016bb34970c516acde5240e85ed4387dbe3aeb9189f50db5525bd76/tcp/app
 ```
 
 ### `forward`
@@ -157,6 +188,12 @@ iroh-proxy forward-config ./config.toml
 
 ## Config file
 
+Default config path:
+
+```text
+~/.config/iroh-proxy/config.toml
+```
+
 See `config.example.toml`.
 
 ```toml
@@ -179,37 +216,36 @@ listen = "127.0.0.1:18000"
 remote = "<endpoint-id>/tcp/vllm"
 ```
 
-You can include only the section needed by the command you run:
+Sections are optional:
+- `[serve]` is used by `server` and `add-serve -p`
+- `[forward]` is used by `server` (persisted runtime listeners), `add-forward -p`, and `forward-config`
 
-- `serve-config` requires `[serve]`
-- `forward-config` requires `[forward]`
+## End-to-end example
 
-## End-to-end example (multi-service)
-
-On GPU machine:
-
-```bash
-iroh-proxy serve-config ./config.toml
-```
-
-The process prints the endpoint id and all exported service paths:
-
-```text
-<endpoint-id>/tcp/ollama
-<endpoint-id>/tcp/vllm
-```
-
-On client machine, put that endpoint id into `config.toml`, then run:
+On service host:
 
 ```bash
-iroh-proxy forward-config ./config.toml
+iroh-proxy server
+iroh-proxy add-serve -p ollama localhost:11434
 ```
 
-Now local clients can use each configured listener as if remote services were local.
+Then get endpoint id:
+
+```bash
+iroh-proxy status
+```
+
+On client host:
+
+```bash
+iroh-proxy forward 127.0.0.1:11435 <endpoint-id>/tcp/ollama
+```
+
+Now local clients can use `127.0.0.1:11435` as if `ollama` were local on the service host.
 
 ## Keys and identity
 
-- `serve` and `serve-config` use a persistent key by default:
+- `server` uses a persistent key by default:
   - `~/.config/iroh-proxy/secret_key`
 - `forward` and `forward-config` use an ephemeral in-memory key by default (new id each run).
 - Use `--key-file` to force persistent key behavior for any command.

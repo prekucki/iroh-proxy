@@ -6,9 +6,12 @@ edition = "2024"
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+crossterm = "0.28"
 directories = "5"
+futures-util = "0.3"
 iroh = { version = "0.96.1", features = ["address-lookup-mdns", "address-lookup-pkarr-dht"] }
 rand = "0.9"
+ratatui = "0.29"
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "signal"] }
 toml = "0.8"

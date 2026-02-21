@@ -11,14 +11,14 @@ use iroh::{
 };
 use tokio::io;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, mpsc::UnboundedSender};
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 use zbus::ConnectionBuilder;
 use zbus::fdo;
 
-use crate::config::ServeService;
-use crate::control::{BUS_NAME, OBJECT_PATH};
+use crate::config::{ForwardService, ServeService};
+use crate::control::{BUS_NAME, INTERFACE, OBJECT_PATH};
 use crate::forward::ForwardBinding;
 use crate::remote_path::{RemotePath, service_to_alpn};
 
@@ -30,8 +30,8 @@ struct Route {
 
 #[derive(Debug)]
 struct ForwardRuntime {
-    #[allow(dead_code)]
     remote: RemotePath,
+    persisted: bool,
     task: JoinHandle<()>,
 }
 
@@ -45,6 +45,7 @@ struct ActiveConnection {
 struct ActiveConnGuard {
     id: u64,
     active_connections: Arc<StdMutex<HashMap<u64, ActiveConnection>>>,
+    state_tx: UnboundedSender<Box<str>>,
 }
 
 impl Drop for ActiveConnGuard {
@@ -54,6 +55,7 @@ impl Drop for ActiveConnGuard {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         map.remove(&self.id);
+        let _ = self.state_tx.send("connection-closed".into());
     }
 }
 
@@ -64,6 +66,7 @@ struct ProxyService {
     forwards: Arc<Mutex<HashMap<Box<str>, ForwardRuntime>>>,
     active_connections: Arc<StdMutex<HashMap<u64, ActiveConnection>>>,
     next_conn_id: Arc<AtomicU64>,
+    state_tx: UnboundedSender<Box<str>>,
 }
 
 #[zbus::interface(name = "dev.iroh.Proxy")]
@@ -86,17 +89,51 @@ impl ProxyService {
     }
 
     #[zbus(name = "ListConnections")]
-    async fn list_connections(&self) -> fdo::Result<Vec<(String, String, String)>> {
+    async fn list_connections(&self) -> fdo::Result<Vec<(u64, String, String, String)>> {
         let rows = self
             .active_connections
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .values()
-            .map(|conn| {
+            .iter()
+            .map(|(id, conn)| {
                 (
+                    *id,
                     conn.src.to_string(),
                     conn.kind.to_string(),
                     conn.dst.to_string(),
+                )
+            })
+            .collect::<Vec<_>>();
+        Ok(rows)
+    }
+
+    #[zbus(name = "ListServes")]
+    async fn list_serves(&self) -> fdo::Result<Vec<(String, String)>> {
+        let rows = self
+            .routes
+            .read()
+            .await
+            .values()
+            .map(|route| (route.name.to_string(), route.target.to_string()))
+            .collect::<Vec<_>>();
+        Ok(rows)
+    }
+
+    #[zbus(name = "ListForwards")]
+    async fn list_forwards(&self) -> fdo::Result<Vec<(String, String, bool)>> {
+        let rows = self
+            .forwards
+            .lock()
+            .await
+            .iter()
+            .map(|(listen, runtime)| {
+                (
+                    listen.to_string(),
+                    format!(
+                        "{}/tcp/{}",
+                        runtime.remote.endpoint_id, runtime.remote.service
+                    ),
+                    runtime.persisted,
                 )
             })
             .collect::<Vec<_>>();
@@ -109,6 +146,7 @@ impl ProxyService {
             .await
             .map_err(to_fdo)?;
         sync_endpoint_alpns(&self.endpoint, &self.routes).await;
+        let _ = self.state_tx.send("serve-added".into());
         info!(service = name, target, "added serve route");
         Ok(())
     }
@@ -124,25 +162,42 @@ impl ProxyService {
             )));
         }
         sync_endpoint_alpns(&self.endpoint, &self.routes).await;
+        let _ = self.state_tx.send("serve-removed".into());
         info!(service = name, "removed serve route");
         Ok(())
     }
 
     #[zbus(name = "AddForward")]
-    async fn add_forward(&self, listen: &str, remote: &str) -> fdo::Result<()> {
+    async fn add_forward(&self, listen: &str, remote: &str, persisted: bool) -> fdo::Result<()> {
         add_forward_binding(
             self.endpoint.clone(),
             Arc::clone(&self.forwards),
             Arc::clone(&self.active_connections),
             Arc::clone(&self.next_conn_id),
+            self.state_tx.clone(),
             ForwardBinding {
                 listen: listen.into(),
                 remote: remote.parse().map_err(to_fdo)?,
             },
+            persisted,
         )
         .await
         .map_err(to_fdo)?;
         info!(listen, remote, "added forward binding");
+        Ok(())
+    }
+
+    #[zbus(name = "DelForward")]
+    async fn del_forward(&self, listen: &str) -> fdo::Result<()> {
+        let removed = self.forwards.lock().await.remove(listen);
+        if removed.is_none() {
+            return Err(fdo::Error::Failed(format!(
+                "listener '{}' is not currently forwarded",
+                listen
+            )));
+        }
+        let _ = self.state_tx.send("forward-removed".into());
+        info!(listen, "removed forward binding");
         Ok(())
     }
 }
@@ -159,7 +214,11 @@ async fn sync_endpoint_alpns(endpoint: &Endpoint, routes: &Arc<RwLock<HashMap<Ve
     endpoint.set_alpns(alpns);
 }
 
-pub async fn run_server(secret_key: SecretKey, initial_services: Vec<ServeService>) -> Result<()> {
+pub async fn run_server(
+    secret_key: SecretKey,
+    initial_services: Vec<ServeService>,
+    initial_forwards: Vec<ForwardService>,
+) -> Result<()> {
     let endpoint = Endpoint::empty_builder(RelayMode::Default)
         .secret_key(secret_key)
         .address_lookup(DhtAddressLookup::builder().n0_dns_pkarr_relay())
@@ -172,11 +231,34 @@ pub async fn run_server(secret_key: SecretKey, initial_services: Vec<ServeServic
     let forwards = Arc::new(Mutex::new(HashMap::<Box<str>, ForwardRuntime>::new()));
     let active_connections = Arc::new(StdMutex::new(HashMap::<u64, ActiveConnection>::new()));
     let next_conn_id = Arc::new(AtomicU64::new(1));
+    let (state_tx, mut state_rx) = tokio::sync::mpsc::unbounded_channel::<Box<str>>();
 
     for service in initial_services {
         add_serve_route(&routes, &service.name, &service.target).await?;
     }
     sync_endpoint_alpns(&endpoint, &routes).await;
+
+    for forward in initial_forwards {
+        let remote = forward.remote.parse::<RemotePath>().with_context(|| {
+            format!(
+                "invalid remote path '{}' in persisted forward '{}'",
+                forward.remote, forward.listen
+            )
+        })?;
+        add_forward_binding(
+            endpoint.clone(),
+            Arc::clone(&forwards),
+            Arc::clone(&active_connections),
+            Arc::clone(&next_conn_id),
+            state_tx.clone(),
+            ForwardBinding {
+                listen: forward.listen,
+                remote,
+            },
+            true,
+        )
+        .await?;
+    }
 
     let svc = ProxyService {
         endpoint: endpoint.clone(),
@@ -184,12 +266,30 @@ pub async fn run_server(secret_key: SecretKey, initial_services: Vec<ServeServic
         forwards: Arc::clone(&forwards),
         active_connections: Arc::clone(&active_connections),
         next_conn_id: Arc::clone(&next_conn_id),
+        state_tx: state_tx.clone(),
     };
     let _dbus = ConnectionBuilder::session()?
         .name(BUS_NAME)?
         .serve_at(OBJECT_PATH, svc)?
         .build()
         .await?;
+    let dbus_signal_conn = _dbus.clone();
+    tokio::spawn(async move {
+        while let Some(reason) = state_rx.recv().await {
+            if let Err(err) = dbus_signal_conn
+                .emit_signal(
+                    None::<&str>,
+                    OBJECT_PATH,
+                    INTERFACE,
+                    "StateChanged",
+                    &(reason.as_ref(),),
+                )
+                .await
+            {
+                warn!(error = %err, reason = %reason, "failed to emit state change signal");
+            }
+        }
+    });
 
     info!(endpoint_id = %endpoint.id(), "proxy server started");
     {
@@ -207,6 +307,7 @@ pub async fn run_server(secret_key: SecretKey, initial_services: Vec<ServeServic
     let routes_for_accept = Arc::clone(&routes);
     let active_for_accept = Arc::clone(&active_connections);
     let next_conn_id_for_accept = Arc::clone(&next_conn_id);
+    let state_tx_for_accept = state_tx.clone();
     tokio::spawn(async move {
         loop {
             let incoming = match endpoint.accept().await {
@@ -220,6 +321,7 @@ pub async fn run_server(secret_key: SecretKey, initial_services: Vec<ServeServic
             let routes = Arc::clone(&routes_for_accept);
             let active_connections = Arc::clone(&active_for_accept);
             let next_conn_id = Arc::clone(&next_conn_id_for_accept);
+            let state_tx = state_tx_for_accept.clone();
             let peer_addr = incoming.remote_address();
             let local_ip = incoming.local_ip();
             tokio::spawn(async move {
@@ -228,6 +330,7 @@ pub async fn run_server(secret_key: SecretKey, initial_services: Vec<ServeServic
                     Arc::clone(&routes),
                     active_connections,
                     next_conn_id,
+                    state_tx,
                 )
                 .await
                 {
@@ -289,7 +392,9 @@ async fn add_forward_binding(
     forwards: Arc<Mutex<HashMap<Box<str>, ForwardRuntime>>>,
     active_connections: Arc<StdMutex<HashMap<u64, ActiveConnection>>>,
     next_conn_id: Arc<AtomicU64>,
+    state_tx: UnboundedSender<Box<str>>,
     binding: ForwardBinding,
+    persisted: bool,
 ) -> Result<()> {
     let mut map = forwards.lock().await;
     if map.contains_key(&binding.listen) {
@@ -302,6 +407,7 @@ async fn add_forward_binding(
     let listen = binding.listen.clone();
     let remote = binding.remote.clone();
     let alpn = remote.to_alpn();
+    let state_tx_for_task = state_tx.clone();
 
     let task = tokio::spawn(async move {
         loop {
@@ -318,6 +424,7 @@ async fn add_forward_binding(
             let alpn = alpn.clone();
             let active_connections = Arc::clone(&active_connections);
             let next_conn_id = Arc::clone(&next_conn_id);
+            let state_tx = state_tx_for_task.clone();
             tokio::spawn(async move {
                 if let Err(err) = handle_forward_conn(
                     endpoint,
@@ -326,6 +433,7 @@ async fn add_forward_binding(
                     alpn,
                     active_connections,
                     next_conn_id,
+                    state_tx,
                 )
                 .await
                 {
@@ -339,9 +447,11 @@ async fn add_forward_binding(
         binding.listen.clone(),
         ForwardRuntime {
             remote: binding.remote,
+            persisted,
             task,
         },
     );
+    let _ = state_tx.send("forward-added".into());
 
     Ok(())
 }
@@ -351,6 +461,7 @@ async fn handle_incoming(
     routes: Arc<RwLock<HashMap<Vec<u8>, Route>>>,
     active_connections: Arc<StdMutex<HashMap<u64, ActiveConnection>>>,
     next_conn_id: Arc<AtomicU64>,
+    state_tx: UnboundedSender<Box<str>>,
 ) -> Result<()> {
     let conn = incoming.await?;
     let negotiated = conn.alpn().to_vec();
@@ -372,6 +483,7 @@ async fn handle_incoming(
     let _guard = register_connection(
         Arc::clone(&active_connections),
         Arc::clone(&next_conn_id),
+        state_tx.clone(),
         ActiveConnection {
             src: conn.remote_id().to_string().into(),
             kind: "serve".into(),
@@ -398,7 +510,12 @@ async fn handle_forward_conn(
     alpn: Vec<u8>,
     active_connections: Arc<StdMutex<HashMap<u64, ActiveConnection>>>,
     next_conn_id: Arc<AtomicU64>,
+    state_tx: UnboundedSender<Box<str>>,
 ) -> Result<()> {
+    let src = inbound
+        .peer_addr()
+        .map(|addr| addr.to_string())
+        .unwrap_or_else(|_| "<unknown>".to_string());
     let conn = endpoint
         .connect(remote.endpoint_id, &alpn)
         .await
@@ -411,8 +528,9 @@ async fn handle_forward_conn(
     let _guard = register_connection(
         Arc::clone(&active_connections),
         Arc::clone(&next_conn_id),
+        state_tx.clone(),
         ActiveConnection {
-            src: conn.remote_id().to_string().into(),
+            src: src.into(),
             kind: "forward".into(),
             dst: format!("{}/tcp/{}", remote.endpoint_id, remote.service).into(),
         },
@@ -430,6 +548,7 @@ async fn handle_forward_conn(
 fn register_connection(
     active_connections: Arc<StdMutex<HashMap<u64, ActiveConnection>>>,
     next_conn_id: Arc<AtomicU64>,
+    state_tx: UnboundedSender<Box<str>>,
     info: ActiveConnection,
 ) -> ActiveConnGuard {
     let id = next_conn_id.fetch_add(1, Ordering::Relaxed);
@@ -439,9 +558,11 @@ fn register_connection(
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         map.insert(id, info);
     }
+    let _ = state_tx.send("connection-opened".into());
     ActiveConnGuard {
         id,
         active_connections: Arc::clone(&active_connections),
+        state_tx,
     }
 }
 

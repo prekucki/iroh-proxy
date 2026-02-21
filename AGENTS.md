@@ -8,8 +8,9 @@ Build a small, reliable Rust CLI that uses iroh to proxy services over TCP.
 
 Primary workflow:
 
-1. `serve --name <name> <target>` on the service host.
-2. `forward <listen> <endpoint-id>/tcp/<name>` on the client host.
+1. `server` on the service host (typically user systemd).
+2. `add-serve [-p] <name> <target>` on the service host.
+3. `forward <listen> <endpoint-id>/tcp/<name>` on the client host.
 
 ## Scope
 
@@ -64,7 +65,7 @@ If behavior changes, update:
 
 When requested, prefer incremental additions in this order:
 
-1. Multi-service mapping in one `serve` process.
+1. Multi-service mapping in one `server` process.
 2. Better connection retry/backoff in `forward`.
-3. Access controls (allowlist/token) on `serve`.
+3. Access controls (allowlist/token) on `server`.
 4. UDP or protocol-aware modes (HTTP/WebSocket) as separate commands.

@@ -12,12 +12,20 @@ pub struct Cli {
     /// Path to persistent iroh secret key (defaults to ~/.config/iroh-proxy/secret_key)
     #[arg(long)]
     pub key_file: Option<PathBuf>,
+
+    /// Path to proxy config file (defaults to ~/.config/iroh-proxy/config.toml)
+    #[arg(long)]
+    pub config_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Subcommand)]
 pub enum Commands {
     /// Run a long-lived proxy server with DBus control interface
-    Server,
+    Server {
+        /// Install a user systemd unit at ~/.config/systemd/user/iroh-proxy.service
+        #[arg(long)]
+        install: bool,
+    },
 
     /// Show if the live proxy server is running and current connection count
     Status {
@@ -31,6 +39,10 @@ pub enum Commands {
 
     /// Add a forward rule to the live proxy server
     AddForward {
+        /// Persist this forward rule to config file
+        #[arg(short = 'p', long)]
+        persistent: bool,
+
         /// Local listen address in host:port form
         listen: String,
         /// Remote path in form: <node-id>/tcp/<name>
@@ -39,6 +51,10 @@ pub enum Commands {
 
     /// Add a served TCP service to the live proxy server
     AddServe {
+        /// Persist this serve rule to config file
+        #[arg(short = 'p', long)]
+        persistent: bool,
+
         /// Service name used in remote path: <node-id>/tcp/<name>
         name: String,
         /// Local target in host:port form
@@ -49,22 +65,6 @@ pub enum Commands {
     DelServe {
         /// Service name used in remote path: <node-id>/tcp/<name>
         name: String,
-    },
-
-    /// Serve a local TCP service over iroh as a named endpoint
-    Serve {
-        /// Service name used in remote path: <node-id>/tcp/<name>
-        #[arg(long)]
-        name: String,
-
-        /// Local target in host:port form, e.g. localhost:11434
-        target: String,
-    },
-
-    /// Serve multiple local TCP services from a TOML config file
-    ServeConfig {
-        /// Path to config.toml
-        config: PathBuf,
     },
 
     /// Forward to a remote iroh endpoint path.
