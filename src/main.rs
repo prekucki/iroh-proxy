@@ -37,7 +37,7 @@ fn init_tracing() {
     });
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
-        .with_target(false)
+        .with_target(true)
         .try_init();
 }
 
