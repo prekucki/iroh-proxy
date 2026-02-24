@@ -1,4 +1,5 @@
 use std::cmp::Reverse;
+use std::collections::HashMap;
 use std::io;
 use std::path::Path;
 use std::time::Duration;
@@ -14,7 +15,9 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Wrap};
+use ratatui::widgets::{
+    Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Tabs, Wrap,
+};
 use tokio::sync::mpsc;
 use tokio::time;
 
@@ -53,6 +56,13 @@ impl Pane {
 enum LayoutMode {
     Full,
     Compact,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum IconMode {
+    Enabled,
+    #[default]
+    Disabled,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -141,6 +151,7 @@ struct App {
     focus: Pane,
     compact_focus: CompactFocus,
     compact_routes: RoutesView,
+    icon_mode: IconMode,
     selected_service: Option<usize>,
     selected_forward: Option<usize>,
     selected_connection: Option<usize>,
@@ -157,6 +168,7 @@ impl Default for App {
             focus: Pane::Services,
             compact_focus: CompactFocus::Routes,
             compact_routes: RoutesView::Services,
+            icon_mode: IconMode::Disabled,
             selected_service: None,
             selected_forward: None,
             selected_connection: None,
@@ -343,6 +355,152 @@ fn layout_mode_for_dimensions(width: u16, height: u16) -> LayoutMode {
     }
 }
 
+fn parse_use_nerd_fonts_value(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+fn parse_use_nerd_fonts_env() -> Option<bool> {
+    match std::env::var("USE_NERD_FONTS") {
+        Ok(value) => match parse_use_nerd_fonts_value(&value) {
+            Some(parsed) => Some(parsed),
+            None => {
+                tracing::warn!(
+                    value = %value,
+                    "invalid USE_NERD_FONTS value; falling back to auto detection"
+                );
+                None
+            }
+        },
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            tracing::warn!("USE_NERD_FONTS is not valid unicode; falling back to auto detection");
+            None
+        }
+    }
+}
+
+fn locale_has_utf8(locale: Option<&str>) -> bool {
+    locale
+        .map(|value| {
+            let upper = value.to_ascii_uppercase();
+            upper.contains("UTF-8") || upper.contains("UTF8")
+        })
+        .unwrap_or(false)
+}
+
+fn detect_icon_mode_auto_with_env(env: &HashMap<&str, String>) -> IconMode {
+    if env
+        .get("TERM")
+        .is_some_and(|term| term.eq_ignore_ascii_case("dumb"))
+    {
+        return IconMode::Disabled;
+    }
+
+    let has_utf8_locale = locale_has_utf8(env.get("LC_ALL").map(String::as_str))
+        || locale_has_utf8(env.get("LC_CTYPE").map(String::as_str))
+        || locale_has_utf8(env.get("LANG").map(String::as_str));
+    if !has_utf8_locale {
+        return IconMode::Disabled;
+    }
+
+    IconMode::Enabled
+}
+
+fn detect_icon_mode_auto() -> IconMode {
+    let mut env = HashMap::new();
+    for key in ["TERM", "LC_ALL", "LC_CTYPE", "LANG"] {
+        if let Ok(value) = std::env::var(key) {
+            env.insert(key, value);
+        }
+    }
+    detect_icon_mode_auto_with_env(&env)
+}
+
+fn resolve_icon_mode() -> IconMode {
+    match parse_use_nerd_fonts_env() {
+        Some(true) => IconMode::Enabled,
+        Some(false) => IconMode::Disabled,
+        None => detect_icon_mode_auto(),
+    }
+}
+
+fn services_label(icon_mode: IconMode) -> &'static str {
+    match icon_mode {
+        IconMode::Enabled => " Services",
+        IconMode::Disabled => "Services",
+    }
+}
+
+fn forwards_label(icon_mode: IconMode) -> &'static str {
+    match icon_mode {
+        IconMode::Enabled => " Forwards",
+        IconMode::Disabled => "Forwards",
+    }
+}
+
+fn connections_label(icon_mode: IconMode, compact: bool) -> &'static str {
+    match (icon_mode, compact) {
+        (IconMode::Enabled, true) => " Conns",
+        (IconMode::Enabled, false) => " Active Connections",
+        (IconMode::Disabled, true) => "Conns",
+        (IconMode::Disabled, false) => "Active Connections",
+    }
+}
+
+fn status_running_label(icon_mode: IconMode) -> &'static str {
+    match icon_mode {
+        IconMode::Enabled => " running",
+        IconMode::Disabled => "running",
+    }
+}
+
+fn status_disconnected_label(icon_mode: IconMode) -> &'static str {
+    match icon_mode {
+        IconMode::Enabled => " disconnected",
+        IconMode::Disabled => "disconnected",
+    }
+}
+
+fn status_up_label(icon_mode: IconMode) -> &'static str {
+    match icon_mode {
+        IconMode::Enabled => " up",
+        IconMode::Disabled => "up",
+    }
+}
+
+fn status_down_label(icon_mode: IconMode) -> &'static str {
+    match icon_mode {
+        IconMode::Enabled => " down",
+        IconMode::Disabled => "down",
+    }
+}
+
+fn endpoint_label(icon_mode: IconMode, compact: bool) -> &'static str {
+    match (icon_mode, compact) {
+        (IconMode::Enabled, true) => "󰩟",
+        (IconMode::Enabled, false) => "󰩟 endpoint",
+        (IconMode::Disabled, true) => "ep",
+        (IconMode::Disabled, false) => "endpoint",
+    }
+}
+
+fn compact_counters_label(icon_mode: IconMode, status: &Status) -> String {
+    match icon_mode {
+        IconMode::Enabled => format!(
+            "  :{}  :{}  :{}",
+            status.served, status.forwards, status.connections
+        ),
+        IconMode::Disabled => format!(
+            " sv:{} fw:{} cn:{}",
+            status.served, status.forwards, status.connections
+        ),
+    }
+}
+
 fn truncate_with_ellipsis(value: &str, max_chars: usize) -> String {
     let chars = value.chars().collect::<Vec<_>>();
     if chars.len() <= max_chars {
@@ -422,7 +580,10 @@ async fn run_tui_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     config_path: &Path,
 ) -> Result<()> {
-    let mut app = App::default();
+    let mut app = App {
+        icon_mode: resolve_icon_mode(),
+        ..App::default()
+    };
     app.apply_snapshot(fetch_snapshot().await?);
 
     let mut input_rx = start_input_thread();
@@ -814,17 +975,27 @@ fn draw_full(frame: &mut ratatui::Frame<'_>, app: &App) {
     let status_lines = if let Some(status) = &app.status {
         vec![
             Line::from(vec![
-                Span::styled("running", Style::default().fg(Color::Green)),
+                Span::styled(
+                    status_running_label(app.icon_mode),
+                    Style::default().fg(Color::Green),
+                ),
                 Span::raw(format!(
                     "  served: {}  forwards: {}  connections: {}",
                     status.served, status.forwards, status.connections
                 )),
             ]),
-            Line::from(format!("endpoint: {}", status.endpoint_id)),
+            Line::from(format!(
+                "{}: {}",
+                endpoint_label(app.icon_mode, false),
+                status.endpoint_id
+            )),
         ]
     } else {
         vec![Line::from(vec![
-            Span::styled("disconnected", Style::default().fg(Color::Red)),
+            Span::styled(
+                status_disconnected_label(app.icon_mode),
+                Style::default().fg(Color::Red),
+            ),
             Span::raw("  waiting for iroh-proxy server on DBus"),
         ])]
     };
@@ -847,23 +1018,25 @@ fn draw_full(frame: &mut ratatui::Frame<'_>, app: &App) {
         frame,
         body[0],
         app,
-        "Services",
+        services_label(app.icon_mode),
         app.focus == Pane::Services,
         false,
+        true,
     );
     draw_forwards(
         frame,
         body[1],
         app,
-        "Forwards",
+        forwards_label(app.icon_mode),
         app.focus == Pane::Forwards,
         false,
+        true,
     );
     draw_connections(
         frame,
         body[2],
         app,
-        "Active Connections",
+        connections_label(app.icon_mode, false),
         app.focus == Pane::Connections,
         false,
     );
@@ -888,21 +1061,25 @@ fn draw_compact(frame: &mut ratatui::Frame<'_>, app: &App) {
         let endpoint_limit = usize::from(vertical[0].width.saturating_sub(4));
         vec![
             Line::from(vec![
-                Span::styled("up", Style::default().fg(Color::Green)),
-                Span::raw(format!(
-                    " sv:{} fw:{} cn:{}",
-                    status.served, status.forwards, status.connections
-                )),
+                Span::styled(
+                    status_up_label(app.icon_mode),
+                    Style::default().fg(Color::Green),
+                ),
+                Span::raw(compact_counters_label(app.icon_mode, status)),
             ]),
             Line::from(format!(
-                "ep: {}",
+                "{}: {}",
+                endpoint_label(app.icon_mode, true),
                 truncate_with_ellipsis(&status.endpoint_id, endpoint_limit)
             )),
         ]
     } else {
         vec![
             Line::from(vec![
-                Span::styled("down", Style::default().fg(Color::Red)),
+                Span::styled(
+                    status_down_label(app.icon_mode),
+                    Style::default().fg(Color::Red),
+                ),
                 Span::raw(" waiting for server"),
             ]),
             Line::from(""),
@@ -916,25 +1093,45 @@ fn draw_compact(frame: &mut ratatui::Frame<'_>, app: &App) {
         .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
         .split(vertical[1]);
 
-    let routes_title = match app.compact_routes {
-        RoutesView::Services => "Routes: Services",
-        RoutesView::Forwards => "Routes: Forwards",
-    };
     let routes_focused = app.compact_focus == CompactFocus::Routes;
+    let routes = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(5)])
+        .split(body[0]);
+
+    draw_routes_tabs(
+        frame,
+        routes[0],
+        app.icon_mode,
+        app.compact_routes,
+        routes_focused,
+    );
     match app.compact_routes {
-        RoutesView::Services => {
-            draw_services(frame, body[0], app, routes_title, routes_focused, true)
-        }
-        RoutesView::Forwards => {
-            draw_forwards(frame, body[0], app, routes_title, routes_focused, true)
-        }
+        RoutesView::Services => draw_services(
+            frame,
+            routes[1],
+            app,
+            services_label(app.icon_mode),
+            routes_focused,
+            true,
+            false,
+        ),
+        RoutesView::Forwards => draw_forwards(
+            frame,
+            routes[1],
+            app,
+            forwards_label(app.icon_mode),
+            routes_focused,
+            true,
+            false,
+        ),
     }
 
     draw_connections(
         frame,
         body[1],
         app,
-        "Conns",
+        connections_label(app.icon_mode, true),
         app.compact_focus == CompactFocus::Connections,
         true,
     );
@@ -947,27 +1144,68 @@ fn draw_compact(frame: &mut ratatui::Frame<'_>, app: &App) {
     frame.render_widget(help, vertical[2]);
 }
 
+fn draw_routes_tabs(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    icon_mode: IconMode,
+    routes_view: RoutesView,
+    focused: bool,
+) {
+    let selected = match routes_view {
+        RoutesView::Services => 0,
+        RoutesView::Forwards => 1,
+    };
+
+    let titles = [
+        Line::styled(
+            format!("  {}  ", services_label(icon_mode)),
+            Style::default().fg(Color::White).bg(Color::DarkGray),
+        ),
+        Line::styled(
+            format!("  {}  ", forwards_label(icon_mode)),
+            Style::default().fg(Color::White).bg(Color::DarkGray),
+        ),
+    ];
+    let highlight = if focused {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::White).bg(Color::Gray)
+    };
+
+    let tabs = Tabs::new(titles)
+        .select(selected)
+        .highlight_style(highlight)
+        .padding("", "")
+        .divider(" ");
+
+    frame.render_widget(tabs, area);
+}
+
 fn draw_services(
     frame: &mut ratatui::Frame<'_>,
     area: Rect,
     app: &App,
-    title: &'static str,
+    title: &str,
     focused: bool,
     compact: bool,
+    decorated: bool,
 ) {
-    let mut block = Block::default().borders(Borders::ALL).title(title);
-    if focused {
-        block = block.border_style(Style::default().fg(Color::Yellow));
-    }
-
     let rows = app
         .services
         .iter()
-        .map(|service| {
-            Row::new(vec![
+        .enumerate()
+        .map(|(idx, service)| {
+            let mut row = Row::new(vec![
                 Cell::from(service.name.to_string()),
                 Cell::from(service.target.to_string()),
-            ])
+            ]);
+            if idx % 2 == 1 {
+                row = row.style(Style::default().bg(Color::DarkGray));
+            }
+            row
         })
         .collect::<Vec<_>>();
 
@@ -977,13 +1215,31 @@ fn draw_services(
         vec![Constraint::Length(18), Constraint::Min(10)]
     };
 
-    let table = Table::new(rows, constraints)
+    let mut table = Table::new(rows, constraints)
+        .style(Style::default().fg(Color::White))
         .header(
-            Row::new(vec!["name", "target"]).style(Style::default().add_modifier(Modifier::BOLD)),
+            Row::new(vec!["name", "target"]).style(
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+            ),
         )
-        .block(block)
-        .row_highlight_style(Style::default().bg(Color::Blue))
+        .row_highlight_style(
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::LightCyan)
+                .add_modifier(Modifier::BOLD),
+        )
+        .column_spacing(1)
         .highlight_symbol(if compact { "> " } else { "-> " });
+
+    if decorated {
+        let mut block = Block::default().borders(Borders::ALL).title(title);
+        if focused {
+            block = block.border_style(Style::default().fg(Color::Yellow));
+        }
+        table = table.block(block);
+    }
 
     let mut state = TableState::default();
     state.select(app.selected_service);
@@ -994,19 +1250,16 @@ fn draw_forwards(
     frame: &mut ratatui::Frame<'_>,
     area: Rect,
     app: &App,
-    title: &'static str,
+    title: &str,
     focused: bool,
     compact: bool,
+    decorated: bool,
 ) {
-    let mut block = Block::default().borders(Borders::ALL).title(title);
-    if focused {
-        block = block.border_style(Style::default().fg(Color::Yellow));
-    }
-
     let rows = app
         .forwards
         .iter()
-        .map(|forward| {
+        .enumerate()
+        .map(|(idx, forward)| {
             let persisted = if compact {
                 if forward.persisted { "y" } else { "n" }
             } else if forward.persisted {
@@ -1014,11 +1267,15 @@ fn draw_forwards(
             } else {
                 "no"
             };
-            Row::new(vec![
+            let mut row = Row::new(vec![
                 Cell::from(forward.listen.to_string()),
                 Cell::from(forward.remote.to_string()),
                 Cell::from(persisted),
-            ])
+            ]);
+            if idx % 2 == 1 {
+                row = row.style(Style::default().bg(Color::DarkGray));
+            }
+            row
         })
         .collect::<Vec<_>>();
 
@@ -1036,25 +1293,41 @@ fn draw_forwards(
         ]
     };
 
-    let table = Table::new(rows, constraints)
+    let mut table = Table::new(rows, constraints)
+        .style(Style::default().fg(Color::White))
         .header(
-            Row::new(vec!["listen", "remote", "p"])
-                .style(Style::default().add_modifier(Modifier::BOLD)),
+            Row::new(vec!["listen", "remote", "p"]).style(
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+            ),
         )
-        .block(block)
-        .row_highlight_style(Style::default().bg(Color::Blue))
+        .row_highlight_style(
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::LightCyan)
+                .add_modifier(Modifier::BOLD),
+        )
+        .column_spacing(1)
         .highlight_symbol(if compact { "> " } else { "-> " });
+
+    if decorated {
+        let mut block = Block::default().borders(Borders::ALL).title(title);
+        if focused {
+            block = block.border_style(Style::default().fg(Color::Yellow));
+        }
+        table = table.block(block);
+    }
 
     let mut state = TableState::default();
     state.select(app.selected_forward);
     frame.render_stateful_widget(table, area, &mut state);
 }
-
 fn draw_connections(
     frame: &mut ratatui::Frame<'_>,
     area: Rect,
     app: &App,
-    title: &'static str,
+    title: &str,
     focused: bool,
     compact: bool,
 ) {
@@ -1066,12 +1339,17 @@ fn draw_connections(
     let rows = app
         .connections
         .iter()
-        .map(|conn| {
-            Row::new(vec![
+        .enumerate()
+        .map(|(idx, conn)| {
+            let mut row = Row::new(vec![
                 Cell::from(conn.kind.to_string()),
                 Cell::from(conn.src.to_string()),
                 Cell::from(conn.dst.to_string()),
-            ])
+            ]);
+            if idx % 2 == 1 {
+                row = row.style(Style::default().bg(Color::DarkGray));
+            }
+            row
         })
         .collect::<Vec<_>>();
 
@@ -1090,12 +1368,22 @@ fn draw_connections(
     };
 
     let table = Table::new(rows, constraints)
+        .style(Style::default().fg(Color::White))
         .header(
-            Row::new(vec!["type", "src", "dst"])
-                .style(Style::default().add_modifier(Modifier::BOLD)),
+            Row::new(vec!["type", "src", "dst"]).style(
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+            ),
         )
         .block(block)
-        .row_highlight_style(Style::default().bg(Color::Blue))
+        .row_highlight_style(
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::LightCyan)
+                .add_modifier(Modifier::BOLD),
+        )
+        .column_spacing(1)
         .highlight_symbol(if compact { "> " } else { "-> " });
 
     let mut state = TableState::default();
@@ -1264,6 +1552,7 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 mod tests {
     use super::*;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use std::collections::HashMap;
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -1361,5 +1650,58 @@ mod tests {
         handle_non_modal_key(&mut app, key(KeyCode::Tab), LayoutMode::Compact);
         handle_non_modal_key(&mut app, key(KeyCode::Down), LayoutMode::Compact);
         assert_eq!(app.selected_connection, Some(1));
+    }
+
+    #[test]
+    fn parse_use_nerd_fonts_value_supports_expected_booleans() {
+        assert_eq!(parse_use_nerd_fonts_value("1"), Some(true));
+        assert_eq!(parse_use_nerd_fonts_value("true"), Some(true));
+        assert_eq!(parse_use_nerd_fonts_value("YES"), Some(true));
+        assert_eq!(parse_use_nerd_fonts_value("on"), Some(true));
+        assert_eq!(parse_use_nerd_fonts_value("0"), Some(false));
+        assert_eq!(parse_use_nerd_fonts_value("false"), Some(false));
+        assert_eq!(parse_use_nerd_fonts_value("No"), Some(false));
+        assert_eq!(parse_use_nerd_fonts_value("off"), Some(false));
+        assert_eq!(parse_use_nerd_fonts_value("maybe"), None);
+    }
+
+    #[test]
+    fn auto_icon_mode_prefers_disabled_without_utf8_or_with_dumb_term() {
+        let mut env = HashMap::new();
+        env.insert("TERM", "xterm-256color".to_string());
+        env.insert("LANG", "C".to_string());
+        assert_eq!(detect_icon_mode_auto_with_env(&env), IconMode::Disabled);
+
+        env.insert("LANG", "en_US.UTF-8".to_string());
+        env.insert("TERM", "dumb".to_string());
+        assert_eq!(detect_icon_mode_auto_with_env(&env), IconMode::Disabled);
+    }
+
+    #[test]
+    fn auto_icon_mode_enables_with_utf8_locale_and_non_dumb_term() {
+        let mut env = HashMap::new();
+        env.insert("TERM", "xterm-256color".to_string());
+        env.insert("LANG", "en_US.UTF-8".to_string());
+        assert_eq!(detect_icon_mode_auto_with_env(&env), IconMode::Enabled);
+    }
+
+    #[test]
+    fn labels_fallback_when_icons_disabled() {
+        assert_eq!(services_label(IconMode::Disabled), "Services");
+        assert_eq!(forwards_label(IconMode::Disabled), "Forwards");
+        assert_eq!(
+            connections_label(IconMode::Disabled, false),
+            "Active Connections"
+        );
+        assert_eq!(connections_label(IconMode::Disabled, true), "Conns");
+        assert_eq!(status_running_label(IconMode::Disabled), "running");
+        assert_eq!(
+            status_disconnected_label(IconMode::Disabled),
+            "disconnected"
+        );
+        assert_eq!(status_up_label(IconMode::Disabled), "up");
+        assert_eq!(status_down_label(IconMode::Disabled), "down");
+        assert_eq!(endpoint_label(IconMode::Disabled, false), "endpoint");
+        assert_eq!(endpoint_label(IconMode::Disabled, true), "ep");
     }
 }

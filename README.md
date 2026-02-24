@@ -72,6 +72,11 @@ Open a ratatui dashboard for live server inspection and control.
 iroh-proxy tui
 ```
 
+Optional icon behavior:
+- `USE_NERD_FONTS=1` enables Nerd Font icons in route tabs and pane titles
+- `USE_NERD_FONTS=0` forces plain labels
+- unset uses auto-detection (`TERM`/locale); plain labels are used when detection is not suitable
+
 In the TUI:
 - auto layout mode:
   - full mode at `>=160x36`: always-visible panes for `Services`, `Forwards`, and `Active Connections`
