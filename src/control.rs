@@ -1,12 +1,22 @@
 use anyhow::{Context, Result, anyhow};
-use futures_util::StreamExt;
-use tokio::sync::mpsc;
-use tokio::time::{Duration, sleep};
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+use std::path::PathBuf;
+#[cfg(target_os = "macos")]
+use tokio::net::UnixStream;
+#[cfg(target_os = "windows")]
+use uds_windows::UnixStream as WindowsUnixStream;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+use zbus::connection::Builder as ConnectionBuilder;
 use zbus::{Connection, Proxy};
 
 pub const BUS_NAME: &str = "dev.iroh.Proxy";
 pub const OBJECT_PATH: &str = "/dev/iroh/Proxy";
 pub const INTERFACE: &str = "dev.iroh.Proxy";
+
+#[derive(Clone)]
+pub struct ControlClient {
+    conn: Connection,
+}
 
 #[derive(Debug, Clone)]
 pub struct Status {
@@ -37,188 +47,235 @@ pub struct ForwardRoute {
     pub persisted: bool,
 }
 
-pub async fn status() -> Result<Option<Status>> {
-    let conn = match Connection::session().await {
-        Ok(conn) => conn,
-        Err(_) => return Ok(None),
-    };
-    let proxy = match Proxy::new(&conn, BUS_NAME, OBJECT_PATH, INTERFACE).await {
-        Ok(proxy) => proxy,
-        Err(_) => return Ok(None),
-    };
+#[derive(Debug, Clone, Copy)]
+pub struct Capabilities {
+    pub live_control: bool,
+    pub state_stream: bool,
+    pub transport_label: &'static str,
+}
 
-    let call: Result<(String, u64, u64, u64), zbus::Error> = proxy.call("Status", &()).await;
-    match call {
-        Ok((endpoint_id, connections, served, forwards)) => Ok(Some(Status {
-            endpoint_id: endpoint_id.into(),
-            connections,
-            served,
-            forwards,
-        })),
-        Err(_) => Ok(None),
+pub fn capabilities() -> Capabilities {
+    Capabilities {
+        live_control: true,
+        state_stream: true,
+        transport_label: control_transport_label(),
     }
 }
 
+#[cfg(target_os = "linux")]
+fn control_transport_label() -> &'static str {
+    "dbus"
+}
+
+#[cfg(target_os = "macos")]
+fn control_transport_label() -> &'static str {
+    "zbus-p2p-uds"
+}
+
+#[cfg(target_os = "windows")]
+fn control_transport_label() -> &'static str {
+    "zbus-p2p-windows-uds"
+}
+
+#[cfg(target_os = "macos")]
+pub fn p2p_control_socket_path() -> PathBuf {
+    let base = std::env::var_os("TMPDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp"));
+    base.join("iroh-proxy").join("control.sock")
+}
+
+#[cfg(target_os = "windows")]
+pub fn p2p_control_socket_path() -> PathBuf {
+    std::env::temp_dir().join("iroh-proxy").join("control.sock")
+}
+
+#[cfg(target_os = "linux")]
+async fn platform_connection() -> Result<Connection> {
+    Connection::session()
+        .await
+        .context("failed to connect to DBus session bus")
+}
+
+#[cfg(target_os = "macos")]
+async fn platform_connection() -> Result<Connection> {
+    let socket_path = p2p_control_socket_path();
+    let stream = UnixStream::connect(&socket_path)
+        .await
+        .with_context(|| format!("failed to connect control socket {}", socket_path.display()))?;
+    ConnectionBuilder::unix_stream(stream)
+        .p2p()
+        .build()
+        .await
+        .context("failed to establish zbus p2p connection over unix socket")
+}
+
+#[cfg(target_os = "windows")]
+async fn platform_connection() -> Result<Connection> {
+    let socket_path = p2p_control_socket_path();
+    let stream = tokio::task::spawn_blocking({
+        let socket_path = socket_path.clone();
+        move || WindowsUnixStream::connect(&socket_path)
+    })
+    .await
+    .context("failed to join windows uds connect task")?
+    .with_context(|| format!("failed to connect control socket {}", socket_path.display()))?;
+    ConnectionBuilder::unix_stream(stream)
+        .p2p()
+        .build()
+        .await
+        .context("failed to establish zbus p2p connection over windows uds")
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+compile_error!("iroh-proxy supports Linux, macOS, and Windows only");
+
+async fn connect_control() -> Result<Connection> {
+    platform_connection().await
+}
+
+impl ControlClient {
+    pub async fn connect() -> Result<Self> {
+        let conn = connect_control().await?;
+        Ok(Self { conn })
+    }
+
+    async fn proxy(&self) -> Result<Proxy<'_>> {
+        Proxy::new(&self.conn, BUS_NAME, OBJECT_PATH, INTERFACE)
+            .await
+            .context("failed to connect to iroh-proxy control interface")
+    }
+
+    pub async fn status(&self) -> Result<Option<Status>> {
+        let proxy = match self.proxy().await {
+            Ok(proxy) => proxy,
+            Err(_) => return Ok(None),
+        };
+
+        let call: Result<(String, u64, u64, u64), zbus::Error> = proxy.call("Status", &()).await;
+        match call {
+            Ok((endpoint_id, connections, served, forwards)) => Ok(Some(Status {
+                endpoint_id: endpoint_id.into(),
+                connections,
+                served,
+                forwards,
+            })),
+            Err(_) => Ok(None),
+        }
+    }
+
+    pub async fn add_forward(&self, listen: &str, remote: &str, persisted: bool) -> Result<()> {
+        let proxy = self.proxy().await?;
+        let _: () = proxy
+            .call("AddForward", &(listen, remote, persisted))
+            .await
+            .map_err(|err| anyhow!("AddForward failed: {err}"))?;
+        Ok(())
+    }
+
+    pub async fn list_connections(&self) -> Result<Vec<ActiveConnection>> {
+        let proxy = self.proxy().await?;
+
+        let rows: Vec<(u64, String, String, String)> = proxy
+            .call("ListConnections", &())
+            .await
+            .map_err(|err| anyhow!("ListConnections failed: {err}"))?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, src, kind, dst)| ActiveConnection {
+                id,
+                src: src.into(),
+                kind: kind.into(),
+                dst: dst.into(),
+            })
+            .collect())
+    }
+
+    pub async fn list_serves(&self) -> Result<Vec<ServeRoute>> {
+        let proxy = self.proxy().await?;
+
+        let rows: Vec<(String, String)> = proxy
+            .call("ListServes", &())
+            .await
+            .map_err(|err| anyhow!("ListServes failed: {err}"))?;
+        Ok(rows
+            .into_iter()
+            .map(|(name, target)| ServeRoute {
+                name: name.into(),
+                target: target.into(),
+            })
+            .collect())
+    }
+
+    pub async fn list_forwards(&self) -> Result<Vec<ForwardRoute>> {
+        let proxy = self.proxy().await?;
+
+        let rows: Vec<(String, String, bool)> = proxy
+            .call("ListForwards", &())
+            .await
+            .map_err(|err| anyhow!("ListForwards failed: {err}"))?;
+        Ok(rows
+            .into_iter()
+            .map(|(listen, remote, persisted)| ForwardRoute {
+                listen: listen.into(),
+                remote: remote.into(),
+                persisted,
+            })
+            .collect())
+    }
+
+    pub async fn del_forward(&self, listen: &str) -> Result<()> {
+        let proxy = self.proxy().await?;
+        let _: () = proxy
+            .call("DelForward", &(listen,))
+            .await
+            .map_err(|err| anyhow!("DelForward failed: {err}"))?;
+        Ok(())
+    }
+
+    pub async fn add_serve(&self, name: &str, target: &str) -> Result<()> {
+        let proxy = self.proxy().await?;
+        let _: () = proxy
+            .call("AddServe", &(name, target))
+            .await
+            .map_err(|err| anyhow!("AddServe failed: {err}"))?;
+        Ok(())
+    }
+
+    pub async fn del_serve(&self, name: &str) -> Result<()> {
+        let proxy = self.proxy().await?;
+        let _: () = proxy
+            .call("DelServe", &(name,))
+            .await
+            .map_err(|err| anyhow!("DelServe failed: {err}"))?;
+        Ok(())
+    }
+}
+
+pub async fn status() -> Result<Option<Status>> {
+    let client = match ControlClient::connect().await {
+        Ok(client) => client,
+        Err(_) => return Ok(None),
+    };
+    client.status().await
+}
+
 pub async fn add_forward(listen: &str, remote: &str, persisted: bool) -> Result<()> {
-    let conn = Connection::session()
-        .await
-        .context("failed to connect to DBus session bus")?;
-    let proxy = Proxy::new(&conn, BUS_NAME, OBJECT_PATH, INTERFACE)
-        .await
-        .context("failed to connect to iroh-proxy control interface")?;
-    let _: () = proxy
-        .call("AddForward", &(listen, remote, persisted))
-        .await
-        .map_err(|err| anyhow!("AddForward failed: {err}"))?;
-    Ok(())
+    let client = ControlClient::connect().await?;
+    client.add_forward(listen, remote, persisted).await
 }
 
 pub async fn list_connections() -> Result<Vec<ActiveConnection>> {
-    let conn = Connection::session()
-        .await
-        .context("failed to connect to DBus session bus")?;
-    let proxy = Proxy::new(&conn, BUS_NAME, OBJECT_PATH, INTERFACE)
-        .await
-        .context("failed to connect to iroh-proxy control interface")?;
-
-    let rows: Vec<(u64, String, String, String)> = proxy
-        .call("ListConnections", &())
-        .await
-        .map_err(|err| anyhow!("ListConnections failed: {err}"))?;
-    Ok(rows
-        .into_iter()
-        .map(|(id, src, kind, dst)| ActiveConnection {
-            id,
-            src: src.into(),
-            kind: kind.into(),
-            dst: dst.into(),
-        })
-        .collect())
-}
-
-pub async fn list_serves() -> Result<Vec<ServeRoute>> {
-    let conn = Connection::session()
-        .await
-        .context("failed to connect to DBus session bus")?;
-    let proxy = Proxy::new(&conn, BUS_NAME, OBJECT_PATH, INTERFACE)
-        .await
-        .context("failed to connect to iroh-proxy control interface")?;
-
-    let rows: Vec<(String, String)> = proxy
-        .call("ListServes", &())
-        .await
-        .map_err(|err| anyhow!("ListServes failed: {err}"))?;
-    Ok(rows
-        .into_iter()
-        .map(|(name, target)| ServeRoute {
-            name: name.into(),
-            target: target.into(),
-        })
-        .collect())
-}
-
-pub async fn list_forwards() -> Result<Vec<ForwardRoute>> {
-    let conn = Connection::session()
-        .await
-        .context("failed to connect to DBus session bus")?;
-    let proxy = Proxy::new(&conn, BUS_NAME, OBJECT_PATH, INTERFACE)
-        .await
-        .context("failed to connect to iroh-proxy control interface")?;
-
-    let rows: Vec<(String, String, bool)> = proxy
-        .call("ListForwards", &())
-        .await
-        .map_err(|err| anyhow!("ListForwards failed: {err}"))?;
-    Ok(rows
-        .into_iter()
-        .map(|(listen, remote, persisted)| ForwardRoute {
-            listen: listen.into(),
-            remote: remote.into(),
-            persisted,
-        })
-        .collect())
-}
-
-pub async fn del_forward(listen: &str) -> Result<()> {
-    let conn = Connection::session()
-        .await
-        .context("failed to connect to DBus session bus")?;
-    let proxy = Proxy::new(&conn, BUS_NAME, OBJECT_PATH, INTERFACE)
-        .await
-        .context("failed to connect to iroh-proxy control interface")?;
-    let _: () = proxy
-        .call("DelForward", &(listen,))
-        .await
-        .map_err(|err| anyhow!("DelForward failed: {err}"))?;
-    Ok(())
+    let client = ControlClient::connect().await?;
+    client.list_connections().await
 }
 
 pub async fn add_serve(name: &str, target: &str) -> Result<()> {
-    let conn = Connection::session()
-        .await
-        .context("failed to connect to DBus session bus")?;
-    let proxy = Proxy::new(&conn, BUS_NAME, OBJECT_PATH, INTERFACE)
-        .await
-        .context("failed to connect to iroh-proxy control interface")?;
-    let _: () = proxy
-        .call("AddServe", &(name, target))
-        .await
-        .map_err(|err| anyhow!("AddServe failed: {err}"))?;
-    Ok(())
+    let client = ControlClient::connect().await?;
+    client.add_serve(name, target).await
 }
 
 pub async fn del_serve(name: &str) -> Result<()> {
-    let conn = Connection::session()
-        .await
-        .context("failed to connect to DBus session bus")?;
-    let proxy = Proxy::new(&conn, BUS_NAME, OBJECT_PATH, INTERFACE)
-        .await
-        .context("failed to connect to iroh-proxy control interface")?;
-    let _: () = proxy
-        .call("DelServe", &(name,))
-        .await
-        .map_err(|err| anyhow!("DelServe failed: {err}"))?;
-    Ok(())
-}
-
-pub fn watch_state_changes() -> mpsc::UnboundedReceiver<Box<str>> {
-    let (tx, rx) = mpsc::unbounded_channel::<Box<str>>();
-    tokio::spawn(async move {
-        loop {
-            let conn = match Connection::session().await {
-                Ok(conn) => conn,
-                Err(_) => {
-                    sleep(Duration::from_secs(1)).await;
-                    continue;
-                }
-            };
-            let proxy = match Proxy::new(&conn, BUS_NAME, OBJECT_PATH, INTERFACE).await {
-                Ok(proxy) => proxy,
-                Err(_) => {
-                    sleep(Duration::from_secs(1)).await;
-                    continue;
-                }
-            };
-            let mut stream = match proxy.receive_signal("StateChanged").await {
-                Ok(stream) => stream,
-                Err(_) => {
-                    sleep(Duration::from_secs(1)).await;
-                    continue;
-                }
-            };
-
-            while let Some(msg) = stream.next().await {
-                if let Ok((reason,)) = msg.body().deserialize::<(String,)>() {
-                    if tx.send(reason.into()).is_err() {
-                        return;
-                    }
-                } else if tx.send("state-changed".into()).is_err() {
-                    return;
-                }
-            }
-
-            sleep(Duration::from_millis(300)).await;
-        }
-    });
-    rx
+    let client = ControlClient::connect().await?;
+    client.del_serve(name).await
 }

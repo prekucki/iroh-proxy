@@ -28,7 +28,7 @@ iroh-proxy [--key-file <path>] [--config-file <path>] <command>
 
 ### `server`
 
-Run the long-lived proxy server that exposes a DBus control API.
+Run the long-lived proxy server that exposes a platform-native control API.
 
 `server` loads initial served routes from config (`[serve]`) and persisted forward listeners (`[forward]`).
 
@@ -81,7 +81,7 @@ In the TUI:
 - auto layout mode:
   - full mode at `>=160x36`: always-visible panes for `Services`, `Forwards`, and `Active Connections`
   - compact mode at `<160` columns or `<36` rows: routes table (`Services`/`Forwards`) stacked above `Connections`
-- event-driven live updates from DBus state signals
+- event-driven live updates from control-plane state signals
 - dialogs to add/remove services and forwards
 - remove-forward mode toggle:
   - runtime only (suspend listener)
@@ -92,8 +92,11 @@ Keybinds:
 - compact mode: `Tab` / `Shift-Tab` switch focused row (`Routes`/`Connections`)
 - compact mode: `Left` / `Right` switch routes view (`Services`/`Forwards`)
 - `Up` / `Down`: move selection
-- `a`: add in focused pane
-- `d`: remove selected item
+- when backend is up:
+  - `a`: add in focused pane
+  - `d`: remove selected item
+- when backend is down:
+  - `s`: start backend
 - `r`: resync snapshot
 - `q`: quit
 
@@ -267,6 +270,11 @@ Now local clients can use `127.0.0.1:11435` as if `ollama` were local on the ser
 - Supports only TCP forwarding paths in the form `<endpoint-id>/tcp/<name>`.
 - No authentication/authorization layer beyond iroh endpoint identity yet.
 - No encryption-termination or HTTP-aware features; this is raw TCP stream proxying.
+- Control API backend status:
+  - Linux: DBus (`zbus`) implemented
+  - macOS: sessionless `zbus` P2P over UDS (`$TMPDIR/iroh-proxy/control.sock`)
+  - Windows: sessionless `zbus` P2P over UDS (`%TEMP%\\iroh-proxy\\control.sock`)
+  - `status`/`tui`/`add-serve`/`add-forward`/`del-*` use the same control interface across these transports
 
 ## Development
 

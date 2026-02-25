@@ -35,7 +35,11 @@ pub struct ForwardSection {
 pub fn default_config_path() -> PathBuf {
     ProjectDirs::from("", "", "iroh-proxy")
         .map(|dirs| dirs.config_dir().join("config.toml"))
-        .unwrap_or_else(|| PathBuf::from(".config/iroh-proxy/config.toml"))
+        .unwrap_or_else(|| {
+            PathBuf::from(".config")
+                .join("iroh-proxy")
+                .join("config.toml")
+        })
 }
 
 pub fn load_config(path: &Path) -> Result<Config> {

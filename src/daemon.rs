@@ -1,26 +1,40 @@
 use std::collections::HashMap;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+use std::io::ErrorKind;
 use std::sync::{
     Arc, Mutex as StdMutex,
     atomic::{AtomicU64, Ordering},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+use futures_util::StreamExt;
 use iroh::{
     Endpoint, RelayMode, SecretKey,
     address_lookup::{DhtAddressLookup, MdnsAddressLookup},
 };
 use tokio::io;
 use tokio::net::{TcpListener, TcpStream};
+#[cfg(target_os = "macos")]
+use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, RwLock, mpsc::UnboundedSender};
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
-use zbus::ConnectionBuilder;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+use zbus::Connection;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+use zbus::MessageStream;
+use zbus::connection::Builder as ConnectionBuilder;
 use zbus::fdo;
 
 use crate::config::{ForwardService, ServeService};
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+use crate::control::p2p_control_socket_path;
 use crate::control::{BUS_NAME, INTERFACE, OBJECT_PATH};
 use crate::forward::ForwardBinding;
 use crate::remote_path::{RemotePath, service_to_alpn};
+#[cfg(target_os = "windows")]
+use uds_windows::{UnixListener as WindowsUnixListener, UnixStream as WindowsUnixStream};
 
 #[derive(Debug, Clone)]
 struct Route {
@@ -206,6 +220,308 @@ fn to_fdo(err: impl std::fmt::Display) -> fdo::Error {
     fdo::Error::Failed(err.to_string())
 }
 
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn is_expected_signal_disconnect(err: &zbus::Error) -> bool {
+    match err {
+        zbus::Error::InputOutput(ioerr) => matches!(
+            ioerr.kind(),
+            ErrorKind::BrokenPipe
+                | ErrorKind::ConnectionAborted
+                | ErrorKind::ConnectionReset
+                | ErrorKind::NotConnected
+                | ErrorKind::UnexpectedEof
+        ),
+        _ => false,
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn spawn_p2p_state_signal_fanout(
+    mut state_rx: tokio::sync::mpsc::UnboundedReceiver<Box<str>>,
+    peers: Arc<Mutex<HashMap<u64, Connection>>>,
+) {
+    tokio::spawn(async move {
+        while let Some(reason) = state_rx.recv().await {
+            let snapshot = { peers.lock().await.clone() };
+            if snapshot.is_empty() {
+                continue;
+            }
+
+            let mut failed_ids = Vec::new();
+            for (peer_id, conn) in snapshot {
+                if let Err(err) = conn
+                    .emit_signal(
+                        None::<&str>,
+                        OBJECT_PATH,
+                        INTERFACE,
+                        "StateChanged",
+                        &(reason.as_ref(),),
+                    )
+                    .await
+                {
+                    if is_expected_signal_disconnect(&err) {
+                        info!(error = %err, reason = %reason, "control peer disconnected");
+                    } else {
+                        warn!(error = %err, reason = %reason, "failed to emit state change signal");
+                    }
+                    failed_ids.push(peer_id);
+                }
+            }
+
+            if !failed_ids.is_empty() {
+                let mut map = peers.lock().await;
+                for peer_id in failed_ids {
+                    map.remove(&peer_id);
+                }
+            }
+        }
+    });
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn spawn_p2p_peer_disconnect_monitor(
+    peer_id: u64,
+    conn: Connection,
+    peers: Arc<Mutex<HashMap<u64, Connection>>>,
+) {
+    tokio::spawn(async move {
+        let mut stream = MessageStream::from(conn);
+        while let Some(message) = stream.next().await {
+            if let Err(err) = message {
+                if is_expected_signal_disconnect(&err) {
+                    info!(peer_id, error = %err, "control peer disconnected");
+                } else {
+                    warn!(peer_id, error = %err, "control peer stream ended with error");
+                }
+                break;
+            }
+        }
+
+        peers.lock().await.remove(&peer_id);
+    });
+}
+
+#[cfg(target_os = "macos")]
+async fn bind_macos_control_socket(socket_path: &std::path::Path) -> Result<UnixListener> {
+    match UnixListener::bind(socket_path) {
+        Ok(listener) => Ok(listener),
+        Err(bind_err) if bind_err.kind() == ErrorKind::AddrInUse => {
+            match UnixStream::connect(socket_path).await {
+                Ok(_) => bail!(
+                    "control socket {} is already served by a running daemon",
+                    socket_path.display()
+                ),
+                Err(connect_err)
+                    if matches!(
+                        connect_err.kind(),
+                        ErrorKind::ConnectionRefused | ErrorKind::NotFound
+                    ) =>
+                {
+                    match std::fs::remove_file(socket_path) {
+                        Ok(()) => {}
+                        Err(remove_err) if remove_err.kind() == ErrorKind::NotFound => {}
+                        Err(remove_err) => {
+                            return Err(remove_err).with_context(|| {
+                                format!(
+                                    "failed to remove stale control socket {}",
+                                    socket_path.display()
+                                )
+                            });
+                        }
+                    }
+                    UnixListener::bind(socket_path).with_context(|| {
+                        format!(
+                            "failed to bind control socket {} after stale cleanup",
+                            socket_path.display()
+                        )
+                    })
+                }
+                Err(connect_err) => Err(connect_err).with_context(|| {
+                    format!(
+                        "failed to probe existing control socket {}",
+                        socket_path.display()
+                    )
+                }),
+            }
+        }
+        Err(bind_err) => Err(bind_err)
+            .with_context(|| format!("failed to bind control socket {}", socket_path.display())),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn bind_windows_control_socket(socket_path: &std::path::Path) -> Result<WindowsUnixListener> {
+    match WindowsUnixListener::bind(socket_path) {
+        Ok(listener) => Ok(listener),
+        Err(bind_err) if bind_err.kind() == ErrorKind::AddrInUse => {
+            match WindowsUnixStream::connect(socket_path) {
+                Ok(_) => bail!(
+                    "control socket {} is already served by a running daemon",
+                    socket_path.display()
+                ),
+                Err(connect_err)
+                    if matches!(
+                        connect_err.kind(),
+                        ErrorKind::ConnectionRefused | ErrorKind::NotFound
+                    ) =>
+                {
+                    match std::fs::remove_file(socket_path) {
+                        Ok(()) => {}
+                        Err(remove_err) if remove_err.kind() == ErrorKind::NotFound => {}
+                        Err(remove_err) => {
+                            return Err(remove_err).with_context(|| {
+                                format!(
+                                    "failed to remove stale control socket {}",
+                                    socket_path.display()
+                                )
+                            });
+                        }
+                    }
+                    WindowsUnixListener::bind(socket_path).with_context(|| {
+                        format!(
+                            "failed to bind control socket {} after stale cleanup",
+                            socket_path.display()
+                        )
+                    })
+                }
+                Err(connect_err) => Err(connect_err).with_context(|| {
+                    format!(
+                        "failed to probe existing control socket {}",
+                        socket_path.display()
+                    )
+                }),
+            }
+        }
+        Err(bind_err) => Err(bind_err)
+            .with_context(|| format!("failed to bind control socket {}", socket_path.display())),
+    }
+}
+
+#[cfg(target_os = "macos")]
+async fn start_p2p_control_plane(
+    svc: ProxyService,
+    state_rx: tokio::sync::mpsc::UnboundedReceiver<Box<str>>,
+) -> Result<()> {
+    let socket_path = p2p_control_socket_path();
+    if let Some(parent) = socket_path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed to create control socket directory {}",
+                parent.display()
+            )
+        })?;
+    }
+    let listener = bind_macos_control_socket(&socket_path).await?;
+    let peers = Arc::new(Mutex::new(HashMap::<u64, Connection>::new()));
+    let next_peer_id = Arc::new(AtomicU64::new(1));
+    spawn_p2p_state_signal_fanout(state_rx, Arc::clone(&peers));
+
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = match listener.accept().await {
+                Ok(pair) => pair,
+                Err(err) => {
+                    warn!(error = %err, "control socket accept failed");
+                    continue;
+                }
+            };
+
+            let builder = ConnectionBuilder::unix_stream(stream)
+                .server(zbus::Guid::generate())
+                .and_then(|builder| builder.p2p().serve_at(OBJECT_PATH, svc.clone()))
+                .and_then(|builder| builder.name(BUS_NAME));
+            let builder = match builder {
+                Ok(builder) => builder,
+                Err(err) => {
+                    warn!(error = %err, "failed preparing p2p control connection");
+                    continue;
+                }
+            };
+
+            match builder.build().await {
+                Ok(conn) => {
+                    let peer_id = next_peer_id.fetch_add(1, Ordering::Relaxed);
+                    peers.lock().await.insert(peer_id, conn.clone());
+                    spawn_p2p_peer_disconnect_monitor(peer_id, conn, Arc::clone(&peers));
+                }
+                Err(err) => warn!(error = %err, "failed creating p2p control connection"),
+            }
+        }
+    });
+
+    info!(socket = %socket_path.display(), "p2p control plane ready");
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+async fn start_p2p_control_plane(
+    svc: ProxyService,
+    state_rx: tokio::sync::mpsc::UnboundedReceiver<Box<str>>,
+) -> Result<()> {
+    let socket_path = p2p_control_socket_path();
+    if let Some(parent) = socket_path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed to create control socket directory {}",
+                parent.display()
+            )
+        })?;
+    }
+    let listener = bind_windows_control_socket(&socket_path)?;
+    let peers = Arc::new(Mutex::new(HashMap::<u64, Connection>::new()));
+    let next_peer_id = Arc::new(AtomicU64::new(1));
+    spawn_p2p_state_signal_fanout(state_rx, Arc::clone(&peers));
+
+    tokio::spawn(async move {
+        loop {
+            let accept_listener = match listener.try_clone() {
+                Ok(listener) => listener,
+                Err(err) => {
+                    warn!(error = %err, "failed cloning control socket listener");
+                    break;
+                }
+            };
+            let (stream, _) =
+                match tokio::task::spawn_blocking(move || accept_listener.accept()).await {
+                    Ok(Ok(pair)) => pair,
+                    Ok(Err(err)) => {
+                        warn!(error = %err, "control socket accept failed");
+                        continue;
+                    }
+                    Err(err) => {
+                        warn!(error = %err, "control socket accept task failed");
+                        continue;
+                    }
+                };
+
+            let builder = ConnectionBuilder::unix_stream(stream)
+                .server(zbus::Guid::generate())
+                .map(|builder| builder.p2p())
+                .and_then(|builder| builder.serve_at(OBJECT_PATH, svc.clone()))
+                .and_then(|builder| builder.name(BUS_NAME));
+            let builder = match builder {
+                Ok(builder) => builder,
+                Err(err) => {
+                    warn!(error = %err, "failed preparing p2p control connection");
+                    continue;
+                }
+            };
+
+            match builder.build().await {
+                Ok(conn) => {
+                    let peer_id = next_peer_id.fetch_add(1, Ordering::Relaxed);
+                    peers.lock().await.insert(peer_id, conn.clone());
+                    spawn_p2p_peer_disconnect_monitor(peer_id, conn, Arc::clone(&peers));
+                }
+                Err(err) => warn!(error = %err, "failed creating p2p control connection"),
+            }
+        }
+    });
+
+    info!(socket = %socket_path.display(), "p2p control plane ready");
+    Ok(())
+}
+
 async fn sync_endpoint_alpns(endpoint: &Endpoint, routes: &Arc<RwLock<HashMap<Vec<u8>, Route>>>) {
     let alpns = {
         let map = routes.read().await;
@@ -231,6 +547,7 @@ pub async fn run_server(
     let forwards = Arc::new(Mutex::new(HashMap::<Box<str>, ForwardRuntime>::new()));
     let active_connections = Arc::new(StdMutex::new(HashMap::<u64, ActiveConnection>::new()));
     let next_conn_id = Arc::new(AtomicU64::new(1));
+    #[cfg_attr(any(target_os = "macos", target_os = "windows"), allow(unused_mut))]
     let (state_tx, mut state_rx) = tokio::sync::mpsc::unbounded_channel::<Box<str>>();
 
     for service in initial_services {
@@ -268,27 +585,44 @@ pub async fn run_server(
         next_conn_id: Arc::clone(&next_conn_id),
         state_tx: state_tx.clone(),
     };
-    let _dbus = ConnectionBuilder::session()?
-        .name(BUS_NAME)?
-        .serve_at(OBJECT_PATH, svc)?
-        .build()
-        .await?;
-    let dbus_signal_conn = _dbus.clone();
-    tokio::spawn(async move {
-        while let Some(reason) = state_rx.recv().await {
-            if let Err(err) = dbus_signal_conn
-                .emit_signal(
-                    None::<&str>,
-                    OBJECT_PATH,
-                    INTERFACE,
-                    "StateChanged",
-                    &(reason.as_ref(),),
-                )
-                .await
-            {
-                warn!(error = %err, reason = %reason, "failed to emit state change signal");
+
+    #[cfg(target_os = "linux")]
+    let _control_plane = {
+        let dbus = ConnectionBuilder::session()?
+            .name(BUS_NAME)?
+            .serve_at(OBJECT_PATH, svc)?
+            .build()
+            .await?;
+        let dbus_signal_conn = dbus.clone();
+        tokio::spawn(async move {
+            while let Some(reason) = state_rx.recv().await {
+                if let Err(err) = dbus_signal_conn
+                    .emit_signal(
+                        None::<&str>,
+                        OBJECT_PATH,
+                        INTERFACE,
+                        "StateChanged",
+                        &(reason.as_ref(),),
+                    )
+                    .await
+                {
+                    warn!(error = %err, reason = %reason, "failed to emit state change signal");
+                }
             }
-        }
+        });
+        dbus
+    };
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    start_p2p_control_plane(svc, state_rx).await?;
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    tokio::spawn(async move {
+        warn!(
+            os = %std::env::consts::OS,
+            "control API transport is not implemented yet on this platform"
+        );
+        while state_rx.recv().await.is_some() {}
     });
 
     info!(endpoint_id = %endpoint.id(), "proxy server started");

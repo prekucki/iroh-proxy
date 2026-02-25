@@ -20,7 +20,7 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Commands {
-    /// Run a long-lived proxy server with DBus control interface
+    /// Run a long-lived proxy server with platform-native control interface
     Server {
         /// Install a user systemd unit at ~/.config/systemd/user/iroh-proxy.service
         #[arg(long)]
