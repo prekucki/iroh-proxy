@@ -4,3 +4,4 @@ secret_key
 *.key
 *.secret
 .env
+.idea/

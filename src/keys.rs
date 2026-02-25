@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow};
 use directories::ProjectDirs;
 use iroh::SecretKey;
+use rand::SeedableRng;
+use rand::rngs::StdRng;
 
 pub struct ServeKeyLock {
     file: File,
@@ -13,7 +15,11 @@ pub struct ServeKeyLock {
 pub fn default_key_path() -> PathBuf {
     ProjectDirs::from("", "", "iroh-proxy")
         .map(|dirs| dirs.config_dir().join("secret_key"))
-        .unwrap_or_else(|| PathBuf::from(".config/iroh-proxy/secret_key"))
+        .unwrap_or_else(|| {
+            PathBuf::from(".config")
+                .join("iroh-proxy")
+                .join("secret_key")
+        })
 }
 
 pub fn load_or_create_secret_key(path: &Path) -> Result<SecretKey> {
@@ -29,8 +35,7 @@ pub fn load_or_create_secret_key(path: &Path) -> Result<SecretKey> {
             .with_context(|| format!("invalid key in {}", path.display()));
     }
 
-    let mut rng = rand::rng();
-    let sk = SecretKey::generate(&mut rng);
+    let sk = SecretKey::generate(&mut StdRng::from_os_rng());
     std::fs::write(path, sk.to_bytes())
         .with_context(|| format!("failed to write key file {}", path.display()))?;
     Ok(sk)
@@ -45,8 +50,7 @@ fn load_or_create_secret_key_from_file(file: &mut File, path: &Path) -> Result<S
         .with_context(|| format!("failed to read key file {}", path.display()))?;
 
     if raw.is_empty() {
-        let mut rng = rand::rng();
-        let sk = SecretKey::generate(&mut rng);
+        let sk = SecretKey::generate(&mut StdRng::from_os_rng());
         file.set_len(0)
             .with_context(|| format!("failed to truncate key file {}", path.display()))?;
         file.seek(SeekFrom::Start(0))
@@ -107,6 +111,5 @@ pub fn load_or_create_forward_key(key_file: Option<&Path>) -> Result<SecretKey> 
     if let Some(path) = key_file {
         return load_or_create_secret_key(path);
     }
-    let mut rng = rand::rng();
-    Ok(SecretKey::generate(&mut rng))
+    Ok(SecretKey::generate(&mut StdRng::from_os_rng()))
 }
