@@ -2,6 +2,7 @@ use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::io;
 use std::path::Path;
+use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
@@ -541,15 +542,56 @@ fn start_input_thread() -> mpsc::UnboundedReceiver<KeyEvent> {
     rx
 }
 
-async fn fetch_snapshot() -> Result<Snapshot> {
-    let status = control::status().await?;
+async fn get_or_connect_control_client(
+    control_client: &mut Option<control::ControlClient>,
+) -> Result<control::ControlClient> {
+    if let Some(client) = control_client {
+        return Ok(client.clone());
+    }
+    let client = control::ControlClient::connect().await?;
+    *control_client = Some(client.clone());
+    Ok(client)
+}
+
+async fn fetch_snapshot(control_client: &mut Option<control::ControlClient>) -> Result<Snapshot> {
+    let client = match get_or_connect_control_client(control_client).await {
+        Ok(client) => client,
+        Err(_) => return Ok(Snapshot::default()),
+    };
+
+    let status = match client.status().await {
+        Ok(status) => status,
+        Err(_) => {
+            *control_client = None;
+            return Ok(Snapshot::default());
+        }
+    };
     if status.is_none() {
+        *control_client = None;
         return Ok(Snapshot::default());
     }
 
-    let services = control::list_serves().await?;
-    let forwards = control::list_forwards().await?;
-    let connections = control::list_connections().await?;
+    let services = match client.list_serves().await {
+        Ok(services) => services,
+        Err(_) => {
+            *control_client = None;
+            return Ok(Snapshot::default());
+        }
+    };
+    let forwards = match client.list_forwards().await {
+        Ok(forwards) => forwards,
+        Err(_) => {
+            *control_client = None;
+            return Ok(Snapshot::default());
+        }
+    };
+    let connections = match client.list_connections().await {
+        Ok(connections) => connections,
+        Err(_) => {
+            *control_client = None;
+            return Ok(Snapshot::default());
+        }
+    };
     Ok(Snapshot {
         status,
         services,
@@ -558,7 +600,7 @@ async fn fetch_snapshot() -> Result<Snapshot> {
     })
 }
 
-pub async fn run_tui(config_path: &Path) -> Result<()> {
+pub async fn run_tui(config_path: &Path, key_file: Option<&Path>) -> Result<()> {
     enable_raw_mode().context("failed to enable raw mode")?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen).context("failed to enter alternate screen")?;
@@ -566,7 +608,7 @@ pub async fn run_tui(config_path: &Path) -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).context("failed to create terminal")?;
 
-    let result = run_tui_loop(&mut terminal, config_path).await;
+    let result = run_tui_loop(&mut terminal, config_path, key_file).await;
 
     disable_raw_mode().context("failed to disable raw mode")?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)
@@ -579,32 +621,24 @@ pub async fn run_tui(config_path: &Path) -> Result<()> {
 async fn run_tui_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     config_path: &Path,
+    key_file: Option<&Path>,
 ) -> Result<()> {
     let mut app = App {
         icon_mode: resolve_icon_mode(),
         ..App::default()
     };
-    app.apply_snapshot(fetch_snapshot().await?);
+    let mut control_client = None;
+    app.apply_snapshot(fetch_snapshot(&mut control_client).await?);
 
     let mut input_rx = start_input_thread();
-    let mut state_rx = control::watch_state_changes();
-    let mut fallback_sync = time::interval(Duration::from_secs(5));
+    let mut fallback_sync = time::interval(Duration::from_secs(2));
 
     loop {
         terminal.draw(|frame| draw(frame, &app))?;
 
         tokio::select! {
             _ = fallback_sync.tick() => {
-                if let Err(err) = refresh(&mut app).await {
-                    app.set_error(err);
-                }
-            }
-            maybe_reason = state_rx.recv() => {
-                if maybe_reason.is_none() {
-                    state_rx = control::watch_state_changes();
-                    continue;
-                }
-                if let Err(err) = refresh(&mut app).await {
+                if let Err(err) = refresh(&mut app, &mut control_client).await {
                     app.set_error(err);
                 }
             }
@@ -614,7 +648,16 @@ async fn run_tui_loop(
                 };
                 let area = terminal.size().context("failed to query terminal size")?;
                 let layout_mode = layout_mode_for_dimensions(area.width, area.height);
-                if handle_key(&mut app, key, config_path, layout_mode).await? {
+                if handle_key(
+                    &mut app,
+                    key,
+                    config_path,
+                    key_file,
+                    layout_mode,
+                    &mut control_client,
+                )
+                .await?
+                {
                     return Ok(());
                 }
             }
@@ -622,8 +665,8 @@ async fn run_tui_loop(
     }
 }
 
-async fn refresh(app: &mut App) -> Result<()> {
-    app.apply_snapshot(fetch_snapshot().await?);
+async fn refresh(app: &mut App, control_client: &mut Option<control::ControlClient>) -> Result<()> {
+    app.apply_snapshot(fetch_snapshot(control_client).await?);
     Ok(())
 }
 
@@ -631,18 +674,20 @@ async fn handle_key(
     app: &mut App,
     key: KeyEvent,
     config_path: &Path,
+    key_file: Option<&Path>,
     layout_mode: LayoutMode,
+    control_client: &mut Option<control::ControlClient>,
 ) -> Result<bool> {
     if let Some(mut modal) = app.modal.take() {
-        match handle_modal_key(&mut modal, key, config_path).await {
+        match handle_modal_key(&mut modal, key, config_path, control_client).await {
             Ok(ModalOutcome::Stay) => {
                 app.modal = Some(modal);
             }
             Ok(ModalOutcome::Close) => {
-                refresh(app).await?;
+                refresh(app, control_client).await?;
             }
             Ok(ModalOutcome::ShowInfo(msg)) => {
-                refresh(app).await?;
+                refresh(app, control_client).await?;
                 app.set_info(msg);
             }
             Ok(ModalOutcome::ShowError(err)) => {
@@ -657,7 +702,18 @@ async fn handle_key(
 
     match handle_non_modal_key(app, key, layout_mode) {
         KeyAction::Quit => return Ok(true),
-        KeyAction::Refresh => refresh(app).await?,
+        KeyAction::Refresh => refresh(app, control_client).await?,
+        KeyAction::StartBackend => match start_backend(config_path, key_file).await {
+            Ok(true) => {
+                refresh(app, control_client).await?;
+                app.set_info("Started backend server");
+            }
+            Ok(false) => {
+                refresh(app, control_client).await?;
+                app.set_info("Backend is already running");
+            }
+            Err(err) => app.set_error(err),
+        },
         KeyAction::Continue => {}
     }
 
@@ -669,6 +725,7 @@ enum KeyAction {
     Continue,
     Quit,
     Refresh,
+    StartBackend,
 }
 
 fn handle_non_modal_key(app: &mut App, key: KeyEvent, layout_mode: LayoutMode) -> KeyAction {
@@ -694,13 +751,18 @@ fn handle_non_modal_key(app: &mut App, key: KeyEvent, layout_mode: LayoutMode) -
                 KeyAction::Continue
             }
             KeyCode::Char('a') => {
-                app.open_add_dialog(app.focus);
+                if app.status.is_some() {
+                    app.open_add_dialog(app.focus);
+                }
                 KeyAction::Continue
             }
             KeyCode::Char('d') => {
-                app.open_remove_dialog(app.focus);
+                if app.status.is_some() {
+                    app.open_remove_dialog(app.focus);
+                }
                 KeyAction::Continue
             }
+            KeyCode::Char('s') if app.status.is_none() => KeyAction::StartBackend,
             KeyCode::Char('r') => KeyAction::Refresh,
             _ => KeyAction::Continue,
         },
@@ -727,19 +789,61 @@ fn handle_non_modal_key(app: &mut App, key: KeyEvent, layout_mode: LayoutMode) -
                 KeyAction::Continue
             }
             KeyCode::Char('a') => {
-                let pane = app.active_pane(LayoutMode::Compact);
-                app.open_add_dialog(pane);
+                if app.status.is_some() {
+                    let pane = app.active_pane(LayoutMode::Compact);
+                    app.open_add_dialog(pane);
+                }
                 KeyAction::Continue
             }
             KeyCode::Char('d') => {
-                let pane = app.active_pane(LayoutMode::Compact);
-                app.open_remove_dialog(pane);
+                if app.status.is_some() {
+                    let pane = app.active_pane(LayoutMode::Compact);
+                    app.open_remove_dialog(pane);
+                }
                 KeyAction::Continue
             }
+            KeyCode::Char('s') if app.status.is_none() => KeyAction::StartBackend,
             KeyCode::Char('r') => KeyAction::Refresh,
             _ => KeyAction::Continue,
         },
     }
+}
+
+async fn start_backend(config_path: &Path, key_file: Option<&Path>) -> Result<bool> {
+    if control::status().await?.is_some() {
+        return Ok(false);
+    }
+
+    let exe = std::env::current_exe().context("failed to resolve current executable path")?;
+    let mut command = std::process::Command::new(exe);
+    if let Some(path) = key_file {
+        command.arg("--key-file").arg(path);
+    }
+    command.arg("--config-file").arg(config_path);
+    command
+        .arg("server")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    let mut child = command
+        .spawn()
+        .context("failed to start backend server process")?;
+
+    for _ in 0..30 {
+        time::sleep(Duration::from_millis(200)).await;
+        if control::status().await?.is_some() {
+            return Ok(true);
+        }
+        if let Some(status) = child
+            .try_wait()
+            .context("failed while waiting for backend startup")?
+        {
+            return Err(anyhow!("backend server exited while starting ({status})"));
+        }
+    }
+
+    Err(anyhow!("timed out waiting for backend server to start"))
 }
 
 enum ModalOutcome {
@@ -753,25 +857,36 @@ async fn handle_modal_key(
     modal: &mut Modal,
     key: KeyEvent,
     config_path: &Path,
+    control_client: &mut Option<control::ControlClient>,
 ) -> Result<ModalOutcome> {
     match modal {
         Modal::Message { .. } => match key.code {
             KeyCode::Enter | KeyCode::Esc => Ok(ModalOutcome::Close),
             _ => Ok(ModalOutcome::Stay),
         },
-        Modal::AddService(dialog) => handle_add_service_key(dialog, key, config_path).await,
-        Modal::AddForward(dialog) => handle_add_forward_key(dialog, key, config_path).await,
+        Modal::AddService(dialog) => {
+            handle_add_service_key(dialog, key, config_path, control_client).await
+        }
+        Modal::AddForward(dialog) => {
+            handle_add_forward_key(dialog, key, config_path, control_client).await
+        }
         Modal::RemoveService { name } => match key.code {
             KeyCode::Esc => Ok(ModalOutcome::Close),
             KeyCode::Enter => {
-                control::del_serve(name)
+                let client = get_or_connect_control_client(control_client)
+                    .await
+                    .context("failed to connect to running server")?;
+                client
+                    .del_serve(name)
                     .await
                     .with_context(|| format!("failed to remove service '{}'", name))?;
                 Ok(ModalOutcome::ShowInfo(format!("Removed service: {name}")))
             }
             _ => Ok(ModalOutcome::Stay),
         },
-        Modal::RemoveForward(dialog) => handle_remove_forward_key(dialog, key, config_path).await,
+        Modal::RemoveForward(dialog) => {
+            handle_remove_forward_key(dialog, key, config_path, control_client).await
+        }
     }
 }
 
@@ -779,6 +894,7 @@ async fn handle_add_service_key(
     dialog: &mut AddServiceDialog,
     key: KeyEvent,
     config_path: &Path,
+    control_client: &mut Option<control::ControlClient>,
 ) -> Result<ModalOutcome> {
     match key.code {
         KeyCode::Esc => Ok(ModalOutcome::Close),
@@ -819,7 +935,11 @@ async fn handle_add_service_key(
                 )));
             }
 
-            control::add_serve(name, target)
+            let client = get_or_connect_control_client(control_client)
+                .await
+                .context("failed to connect to running server")?;
+            client
+                .add_serve(name, target)
                 .await
                 .with_context(|| format!("failed to add service '{} -> {}'", name, target))?;
             if dialog.persist {
@@ -845,6 +965,7 @@ async fn handle_add_forward_key(
     dialog: &mut AddForwardDialog,
     key: KeyEvent,
     config_path: &Path,
+    control_client: &mut Option<control::ControlClient>,
 ) -> Result<ModalOutcome> {
     match key.code {
         KeyCode::Esc => Ok(ModalOutcome::Close),
@@ -889,7 +1010,11 @@ async fn handle_add_forward_key(
                 .parse::<RemotePath>()
                 .with_context(|| format!("invalid remote path '{}'", remote))?;
 
-            control::add_forward(listen, remote, dialog.persist)
+            let client = get_or_connect_control_client(control_client)
+                .await
+                .context("failed to connect to running server")?;
+            client
+                .add_forward(listen, remote, dialog.persist)
                 .await
                 .with_context(|| format!("failed to add forward '{} -> {}'", listen, remote))?;
             if dialog.persist {
@@ -915,6 +1040,7 @@ async fn handle_remove_forward_key(
     dialog: &mut RemoveForwardDialog,
     key: KeyEvent,
     config_path: &Path,
+    control_client: &mut Option<control::ControlClient>,
 ) -> Result<ModalOutcome> {
     match key.code {
         KeyCode::Esc => Ok(ModalOutcome::Close),
@@ -923,7 +1049,11 @@ async fn handle_remove_forward_key(
             Ok(ModalOutcome::Stay)
         }
         KeyCode::Enter => {
-            control::del_forward(&dialog.listen)
+            let client = get_or_connect_control_client(control_client)
+                .await
+                .context("failed to connect to running server")?;
+            client
+                .del_forward(&dialog.listen)
                 .await
                 .with_context(|| format!("failed to remove forward '{}'", dialog.listen))?;
 
@@ -996,7 +1126,7 @@ fn draw_full(frame: &mut ratatui::Frame<'_>, app: &App) {
                 status_disconnected_label(app.icon_mode),
                 Style::default().fg(Color::Red),
             ),
-            Span::raw("  waiting for iroh-proxy server on DBus"),
+            Span::raw("  waiting for iroh-proxy server (press s to start)"),
         ])]
     };
 
@@ -1041,9 +1171,12 @@ fn draw_full(frame: &mut ratatui::Frame<'_>, app: &App) {
         false,
     );
 
-    let help =
-        Paragraph::new("Tab/Shift-Tab focus  Up/Down move  a add  d remove  r refresh  q quit")
-            .block(Block::default().borders(Borders::ALL).title("Keys"));
+    let help = Paragraph::new(if app.status.is_some() {
+        "Tab/Shift-Tab focus  Up/Down move  a add  d remove  r refresh  q quit"
+    } else {
+        "Tab/Shift-Tab focus  Up/Down move  s start backend  r refresh  q quit"
+    })
+    .block(Block::default().borders(Borders::ALL).title("Keys"));
     frame.render_widget(help, vertical[2]);
 }
 
@@ -1080,7 +1213,7 @@ fn draw_compact(frame: &mut ratatui::Frame<'_>, app: &App) {
                     status_down_label(app.icon_mode),
                     Style::default().fg(Color::Red),
                 ),
-                Span::raw(" waiting for server"),
+                Span::raw(" waiting for server (s=start)"),
             ]),
             Line::from(""),
         ]
@@ -1136,7 +1269,11 @@ fn draw_compact(frame: &mut ratatui::Frame<'_>, app: &App) {
         true,
     );
 
-    let help_text = "Tab row  Left/Right view  Up/Down select  a add  d del  r sync  q quit";
+    let help_text = if app.status.is_some() {
+        "Tab row  Left/Right view  Up/Down select  a add  d del  r sync  q quit"
+    } else {
+        "Tab row  Left/Right view  Up/Down select  s start  r sync  q quit"
+    };
     let help = Paragraph::new(truncate_with_ellipsis(
         help_text,
         usize::from(vertical[2].width),
@@ -1558,6 +1695,15 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
+    fn running_status() -> Status {
+        Status {
+            endpoint_id: "abc".into(),
+            connections: 0,
+            served: 0,
+            forwards: 0,
+        }
+    }
+
     #[test]
     fn layout_mode_thresholds_match_expected_policy() {
         assert_eq!(
@@ -1650,6 +1796,39 @@ mod tests {
         handle_non_modal_key(&mut app, key(KeyCode::Tab), LayoutMode::Compact);
         handle_non_modal_key(&mut app, key(KeyCode::Down), LayoutMode::Compact);
         assert_eq!(app.selected_connection, Some(1));
+    }
+
+    #[test]
+    fn add_remove_actions_are_disabled_when_backend_down() {
+        let mut app = App {
+            focus: Pane::Services,
+            ..App::default()
+        };
+
+        handle_non_modal_key(&mut app, key(KeyCode::Char('a')), LayoutMode::Full);
+        assert!(app.modal.is_none());
+
+        handle_non_modal_key(&mut app, key(KeyCode::Char('d')), LayoutMode::Full);
+        assert!(app.modal.is_none());
+
+        app.status = Some(running_status());
+        handle_non_modal_key(&mut app, key(KeyCode::Char('a')), LayoutMode::Full);
+        assert!(matches!(app.modal, Some(Modal::AddService(_))));
+    }
+
+    #[test]
+    fn start_backend_key_only_when_backend_down() {
+        let mut app = App::default();
+        assert_eq!(
+            handle_non_modal_key(&mut app, key(KeyCode::Char('s')), LayoutMode::Full),
+            KeyAction::StartBackend
+        );
+
+        app.status = Some(running_status());
+        assert_eq!(
+            handle_non_modal_key(&mut app, key(KeyCode::Char('s')), LayoutMode::Full),
+            KeyAction::Continue
+        );
     }
 
     #[test]

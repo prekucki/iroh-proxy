@@ -4,7 +4,7 @@ use std::str::FromStr;
 use std::time::Duration;
 use std::{cmp, io::IsTerminal};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
@@ -15,6 +15,7 @@ mod daemon;
 mod forward;
 mod keys;
 mod remote_path;
+#[cfg(target_os = "linux")]
 mod systemd;
 mod tui;
 
@@ -28,12 +29,14 @@ use control::{
 };
 use daemon::run_server;
 use forward::{ForwardBinding, forward_bindings, forward_stdio};
-use keys::{load_or_create_forward_key, load_or_create_serve_key};
+use keys::{load_or_create_forward_key, load_or_create_serve_key_and_lock};
 use remote_path::RemotePath;
 
 fn init_tracing() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        EnvFilter::new("iroh_proxy=info,portmapper.service=error,netlink_packet_route=error,info")
+        EnvFilter::new(
+            "iroh_proxy=info,mainline::rpc::socket=error,portmapper.service=error,netlink_packet_route=error,info",
+        )
     });
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
@@ -42,6 +45,15 @@ fn init_tracing() {
 }
 
 async fn ensure_server_running(key_file: Option<&Path>, config_file: &Path) -> Result<()> {
+    let caps = control::capabilities();
+    if !caps.live_control {
+        bail!(
+            "live control commands are not available on {} yet (planned transport: {})",
+            std::env::consts::OS,
+            caps.transport_label
+        );
+    }
+
     if control::status().await?.is_some() {
         return Ok(());
     }
@@ -76,7 +88,8 @@ async fn ensure_server_running(key_file: Option<&Path>, config_file: &Path) -> R
     }
 
     Err(anyhow!(
-        "timed out waiting for server to become available on DBus"
+        "timed out waiting for server to become available on {}",
+        caps.transport_label
     ))
 }
 
@@ -159,17 +172,25 @@ async fn main() -> Result<()> {
     match cli.command {
         Commands::Server { install } => {
             if install {
-                let exe = std::env::current_exe()
-                    .context("failed to resolve current executable path for service install")?;
-                let service_path =
-                    systemd::install_user_service(&exe, cli.key_file.as_deref(), &config_path)?;
-                println!("installed: {}", service_path.display());
-                println!("next:");
-                println!("  systemctl --user daemon-reload");
-                println!("  systemctl --user enable --now iroh-proxy.service");
-                return Ok(());
+                #[cfg(not(target_os = "linux"))]
+                {
+                    bail!("server --install is only available on Linux (systemd)");
+                }
+                #[cfg(target_os = "linux")]
+                {
+                    let exe = std::env::current_exe()
+                        .context("failed to resolve current executable path for service install")?;
+                    let service_path =
+                        systemd::install_user_service(&exe, cli.key_file.as_deref(), &config_path)?;
+                    println!("installed: {}", service_path.display());
+                    println!("next:");
+                    println!("  systemctl --user daemon-reload");
+                    println!("  systemctl --user enable --now iroh-proxy.service");
+                    return Ok(());
+                }
             }
-            let secret_key = load_or_create_serve_key(cli.key_file.as_deref())?;
+            let (_key_lock, secret_key) =
+                load_or_create_serve_key_and_lock(cli.key_file.as_deref())?;
             let config = load_config_or_default(&config_path)?;
             let initial_services = config
                 .serve
@@ -182,6 +203,15 @@ async fn main() -> Result<()> {
             run_server(secret_key, initial_services, initial_forwards).await
         }
         Commands::Status { connections } => {
+            let caps = control::capabilities();
+            if !caps.live_control {
+                println!(
+                    "status is not available on {} (planned transport: {})",
+                    std::env::consts::OS,
+                    caps.transport_label
+                );
+                return Ok(());
+            }
             let use_ansi = std::io::stdout().is_terminal();
             match control::status().await? {
                 Some(status) => {
@@ -197,7 +227,17 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
-        Commands::Tui => tui::run_tui(&config_path).await,
+        Commands::Tui => {
+            let caps = control::capabilities();
+            if !caps.live_control || !caps.state_stream {
+                bail!(
+                    "tui requires live control + state stream support (platform: {}, planned transport: {})",
+                    std::env::consts::OS,
+                    caps.transport_label
+                );
+            }
+            tui::run_tui(&config_path, cli.key_file.as_deref()).await
+        }
         Commands::AddForward {
             persistent,
             listen,
