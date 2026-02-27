@@ -164,10 +164,19 @@ impl ControlClient {
         }
     }
 
-    pub async fn add_forward(&self, listen: &str, remote: &str, persisted: bool) -> Result<()> {
+    pub async fn add_forward(
+        &self,
+        listen: &str,
+        remote: &str,
+        persisted: bool,
+        close_on_request_timeout_secs: u64,
+    ) -> Result<()> {
         let proxy = self.proxy().await?;
         let _: () = proxy
-            .call("AddForward", &(listen, remote, persisted))
+            .call(
+                "AddForward",
+                &(listen, remote, persisted, close_on_request_timeout_secs),
+            )
             .await
             .map_err(|err| anyhow!("AddForward failed: {err}"))?;
         Ok(())
@@ -260,9 +269,16 @@ pub async fn status() -> Result<Option<Status>> {
     client.status().await
 }
 
-pub async fn add_forward(listen: &str, remote: &str, persisted: bool) -> Result<()> {
+pub async fn add_forward(
+    listen: &str,
+    remote: &str,
+    persisted: bool,
+    close_on_request_timeout_secs: u64,
+) -> Result<()> {
     let client = ControlClient::connect().await?;
-    client.add_forward(listen, remote, persisted).await
+    client
+        .add_forward(listen, remote, persisted, close_on_request_timeout_secs)
+        .await
 }
 
 pub async fn list_connections() -> Result<Vec<ActiveConnection>> {

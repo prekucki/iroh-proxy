@@ -1014,11 +1014,11 @@ async fn handle_add_forward_key(
                 .await
                 .context("failed to connect to running server")?;
             client
-                .add_forward(listen, remote, dialog.persist)
+                .add_forward(listen, remote, dialog.persist, 2)
                 .await
                 .with_context(|| format!("failed to add forward '{} -> {}'", listen, remote))?;
             if dialog.persist {
-                add_persistent_forward_rule(config_path, listen, remote).with_context(|| {
+                add_persistent_forward_rule(config_path, listen, remote, 2).with_context(|| {
                     format!(
                         "failed to persist forward '{}' in {}",
                         listen,

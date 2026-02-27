@@ -4,8 +4,10 @@ use iroh::{
     address_lookup::{DhtAddressLookup, MdnsAddressLookup},
 };
 use std::io::ErrorKind;
+use std::time::Duration;
 use tokio::io::{self, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 use crate::remote_path::RemotePath;
@@ -25,6 +27,7 @@ fn is_disconnect(err: &std::io::Error) -> bool {
 pub struct ForwardBinding {
     pub listen: Box<str>,
     pub remote: RemotePath,
+    pub close_on_request_timeout: Duration,
 }
 
 async fn build_forward_endpoint(secret_key: SecretKey) -> Result<Endpoint> {
@@ -147,9 +150,12 @@ async fn run_forward_listener(
         let endpoint = endpoint.clone();
         let remote = binding.remote.clone();
         let alpn = alpn.clone();
+        let close_on_request_timeout = binding.close_on_request_timeout;
 
         tokio::spawn(async move {
-            if let Err(err) = handle_forward_conn(endpoint, inbound, remote, alpn).await {
+            if let Err(err) =
+                handle_forward_conn(endpoint, inbound, remote, alpn, close_on_request_timeout).await
+            {
                 eprintln!("forwarding {peer_addr} failed: {err:#}");
             }
         });
@@ -161,7 +167,10 @@ async fn handle_forward_conn(
     inbound: TcpStream,
     remote: RemotePath,
     alpn: Vec<u8>,
+    close_on_request_timeout: Duration,
 ) -> Result<()> {
+    info!("forwarding");
+
     let conn = endpoint
         .connect(remote.endpoint_id, &alpn)
         .await
@@ -174,9 +183,12 @@ async fn handle_forward_conn(
 
     let (mut send, mut recv) = conn.open_bi().await?;
 
+    info!("forward tcp->iroh connected");
+
     let (mut inbound_read, mut inbound_write) = inbound.into_split();
 
-    let inbound_to_remote = async {
+    let inbound_to_remote = async move {
+        warn!("forward tcp->iroh started");
         match io::copy(&mut inbound_read, &mut send).await {
             Ok(bytes) => info!(
                 bytes,
@@ -196,9 +208,10 @@ async fn handle_forward_conn(
         } else {
             info!("forward half-closed iroh send stream after tcp EOF");
         }
+        drop(inbound_read);
         Ok::<(), anyhow::Error>(())
     };
-    let remote_to_inbound = async {
+    let remote_to_inbound: JoinHandle<Result<()>> = tokio::spawn(async move {
         match io::copy(&mut recv, &mut inbound_write).await {
             Ok(bytes) => info!(
                 bytes,
@@ -213,12 +226,22 @@ async fn handle_forward_conn(
                 return Err(err.into());
             }
         }
-        inbound_write.shutdown().await?;
+        drop(recv);
+        drop(inbound_write);
         info!("forward half-closed local tcp write after iroh EOF");
         Ok::<(), anyhow::Error>(())
-    };
+    });
 
-    let _ = tokio::try_join!(inbound_to_remote, remote_to_inbound)?;
+    inbound_to_remote.await?;
+    match tokio::time::timeout(close_on_request_timeout, remote_to_inbound).await {
+        Ok(joined) => joined??,
+        Err(_) => {
+            warn!(
+                timeout_secs = close_on_request_timeout.as_secs_f64(),
+                "forward close-on-request timeout reached; closing connection"
+            );
+        }
+    }
 
     Ok(())
 }

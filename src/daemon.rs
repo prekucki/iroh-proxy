@@ -5,6 +5,7 @@ use std::sync::{
     Arc, Mutex as StdMutex,
     atomic::{AtomicU64, Ordering},
 };
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -62,6 +63,13 @@ struct ActiveConnGuard {
     state_tx: UnboundedSender<Box<str>>,
 }
 
+#[derive(Clone)]
+struct ForwardConnState {
+    active_connections: Arc<StdMutex<HashMap<u64, ActiveConnection>>>,
+    next_conn_id: Arc<AtomicU64>,
+    state_tx: UnboundedSender<Box<str>>,
+}
+
 impl Drop for ActiveConnGuard {
     fn drop(&mut self) {
         let mut map = self
@@ -71,6 +79,17 @@ impl Drop for ActiveConnGuard {
         map.remove(&self.id);
         let _ = self.state_tx.send("connection-closed".into());
     }
+}
+
+fn is_disconnect(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::UnexpectedEof
+            | std::io::ErrorKind::NotConnected
+    )
 }
 
 #[derive(Clone)]
@@ -182,7 +201,13 @@ impl ProxyService {
     }
 
     #[zbus(name = "AddForward")]
-    async fn add_forward(&self, listen: &str, remote: &str, persisted: bool) -> fdo::Result<()> {
+    async fn add_forward(
+        &self,
+        listen: &str,
+        remote: &str,
+        persisted: bool,
+        close_on_request_timeout_secs: u64,
+    ) -> fdo::Result<()> {
         add_forward_binding(
             self.endpoint.clone(),
             Arc::clone(&self.forwards),
@@ -192,12 +217,16 @@ impl ProxyService {
             ForwardBinding {
                 listen: listen.into(),
                 remote: remote.parse().map_err(to_fdo)?,
+                close_on_request_timeout: Duration::from_secs(close_on_request_timeout_secs),
             },
             persisted,
         )
         .await
         .map_err(to_fdo)?;
-        info!(listen, remote, "added forward binding");
+        info!(
+            listen,
+            remote, close_on_request_timeout_secs, "added forward binding"
+        );
         Ok(())
     }
 
@@ -571,6 +600,9 @@ pub async fn run_server(
             ForwardBinding {
                 listen: forward.listen,
                 remote,
+                close_on_request_timeout: Duration::from_secs(
+                    forward.close_on_request_timeout_secs,
+                ),
             },
             true,
         )
@@ -741,6 +773,7 @@ async fn add_forward_binding(
     let listen = binding.listen.clone();
     let remote = binding.remote.clone();
     let alpn = remote.to_alpn();
+    let close_on_request_timeout = binding.close_on_request_timeout;
     let state_tx_for_task = state_tx.clone();
 
     let task = tokio::spawn(async move {
@@ -756,22 +789,28 @@ async fn add_forward_binding(
             let endpoint = endpoint.clone();
             let remote = remote.clone();
             let alpn = alpn.clone();
-            let active_connections = Arc::clone(&active_connections);
-            let next_conn_id = Arc::clone(&next_conn_id);
-            let state_tx = state_tx_for_task.clone();
+            let conn_state = ForwardConnState {
+                active_connections: Arc::clone(&active_connections),
+                next_conn_id: Arc::clone(&next_conn_id),
+                state_tx: state_tx_for_task.clone(),
+            };
             tokio::spawn(async move {
                 if let Err(err) = handle_forward_conn(
                     endpoint,
                     inbound,
                     remote,
                     alpn,
-                    active_connections,
-                    next_conn_id,
-                    state_tx,
+                    close_on_request_timeout,
+                    conn_state,
                 )
                 .await
                 {
-                    warn!(peer = %peer_addr, error = %err, "forwarding connection failed");
+                    warn!(
+                        target: "iroh_proxy::forward",
+                        peer = %peer_addr,
+                        error = %err,
+                        "forwarding connection failed"
+                    );
                 }
             });
         }
@@ -842,40 +881,163 @@ async fn handle_forward_conn(
     inbound: TcpStream,
     remote: RemotePath,
     alpn: Vec<u8>,
-    active_connections: Arc<StdMutex<HashMap<u64, ActiveConnection>>>,
-    next_conn_id: Arc<AtomicU64>,
-    state_tx: UnboundedSender<Box<str>>,
+    close_on_request_timeout: Duration,
+    conn_state: ForwardConnState,
 ) -> Result<()> {
     let src = inbound
         .peer_addr()
         .map(|addr| addr.to_string())
         .unwrap_or_else(|_| "<unknown>".to_string());
-    let conn = endpoint
-        .connect(remote.endpoint_id, &alpn)
-        .await
-        .with_context(|| {
-            format!(
-                "failed connecting to remote endpoint {} (discovery failed via local mDNS and pkarr)",
-                remote.endpoint_id
-            )
-        })?;
+    let remote_id = remote.endpoint_id;
+    let service = remote.service.clone();
+    info!(
+        target: "iroh_proxy::forward",
+        src = %src,
+        remote = %remote_id,
+        service = %service,
+        "forwarding connection"
+    );
+    let conn = endpoint.connect(remote_id, &alpn).await.with_context(|| {
+        format!(
+            "failed connecting to remote endpoint {} (discovery failed via local mDNS and pkarr)",
+            remote_id
+        )
+    })?;
     let _guard = register_connection(
-        Arc::clone(&active_connections),
-        Arc::clone(&next_conn_id),
-        state_tx.clone(),
+        Arc::clone(&conn_state.active_connections),
+        Arc::clone(&conn_state.next_conn_id),
+        conn_state.state_tx.clone(),
         ActiveConnection {
-            src: src.into(),
+            src: src.clone().into(),
             kind: "forward".into(),
-            dst: format!("{}/tcp/{}", remote.endpoint_id, remote.service).into(),
+            dst: format!("{}/tcp/{}", remote_id, service).into(),
         },
     );
     let (mut send, mut recv) = conn.open_bi().await?;
+    info!(
+        target: "iroh_proxy::forward",
+        src = %src,
+        remote = %remote_id,
+        service = %service,
+        "forward stream established"
+    );
     let (mut inbound_read, mut inbound_write) = inbound.into_split();
+    let src_to_remote = src.clone();
+    let service_to_remote = service.clone();
 
-    let to_remote = io::copy(&mut inbound_read, &mut send);
-    let to_local = io::copy(&mut recv, &mut inbound_write);
-    let _ = tokio::try_join!(to_remote, to_local)?;
-    send.finish()?;
+    let to_remote = async {
+        let bytes = match io::copy(&mut inbound_read, &mut send).await {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                if is_disconnect(&err) {
+                    warn!(
+                        target: "iroh_proxy::forward",
+                        src = %src_to_remote,
+                        remote = %remote_id,
+                        service = %service_to_remote,
+                        error = %err,
+                        "forward tcp->iroh disconnected"
+                    );
+                } else {
+                    warn!(
+                        target: "iroh_proxy::forward",
+                        src = %src_to_remote,
+                        remote = %remote_id,
+                        service = %service_to_remote,
+                        error = %err,
+                        "forward tcp->iroh copy failed"
+                    );
+                }
+                return Err(err.into());
+            }
+        };
+        info!(
+            target: "iroh_proxy::forward",
+            src = %src_to_remote,
+            remote = %remote_id,
+            service = %service_to_remote,
+            bytes,
+            "forward tcp->iroh completed"
+        );
+        if let Err(err) = send.finish() {
+            warn!(
+                target: "iroh_proxy::forward",
+                src = %src_to_remote,
+                remote = %remote_id,
+                service = %service_to_remote,
+                error = %err,
+                "forward failed to half-close iroh send stream"
+            );
+        } else {
+            info!(
+                target: "iroh_proxy::forward",
+                src = %src_to_remote,
+                remote = %remote_id,
+                service = %service_to_remote,
+                "forward half-closed iroh send stream"
+            );
+        }
+        Ok::<(), anyhow::Error>(())
+    };
+    let src_to_local = src.clone();
+    let service_to_local = service.clone();
+    let to_local = tokio::spawn(async move {
+        let bytes = match io::copy(&mut recv, &mut inbound_write).await {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                if is_disconnect(&err) {
+                    warn!(
+                        target: "iroh_proxy::forward",
+                        src = %src_to_local,
+                        remote = %remote_id,
+                        service = %service_to_local,
+                        error = %err,
+                        "forward iroh->tcp disconnected"
+                    );
+                } else {
+                    warn!(
+                        target: "iroh_proxy::forward",
+                        src = %src_to_local,
+                        remote = %remote_id,
+                        service = %service_to_local,
+                        error = %err,
+                        "forward iroh->tcp copy failed"
+                    );
+                }
+                return Err(err.into());
+            }
+        };
+        info!(
+            target: "iroh_proxy::forward",
+            src = %src_to_local,
+            remote = %remote_id,
+            service = %service_to_local,
+            bytes,
+            "forward iroh->tcp completed"
+        );
+        Ok::<(), anyhow::Error>(())
+    });
+    to_remote.await?;
+    match tokio::time::timeout(close_on_request_timeout, to_local).await {
+        Ok(joined) => joined??,
+        Err(_) => {
+            warn!(
+                target: "iroh_proxy::forward",
+                src = %src,
+                remote = %remote_id,
+                service = %service,
+                timeout_secs = close_on_request_timeout.as_secs_f64(),
+                "forward close-on-request timeout reached; closing connection"
+            );
+        }
+    }
+    info!(
+        target: "iroh_proxy::forward",
+        src = %src,
+        remote = %remote_id,
+        service = %service,
+        "forwarding finished"
+    );
     Ok(())
 }
 

@@ -146,6 +146,13 @@ If the server is not running, `add-forward` starts it in the background.
 iroh-proxy add-forward <listen-host:port> <endpoint-id>/tcp/<service-name>
 ```
 
+`add-forward` enables close-on-request mode by default, with a 2s timeout after local request upload EOF.
+Tune it with:
+
+```bash
+iroh-proxy add-forward --close-on-request-timeout-secs <seconds> <listen-host:port> <endpoint-id>/tcp/<service-name>
+```
+
 Use `-p` to persist the rule into config (`[forward].services`):
 
 ```bash
@@ -165,6 +172,12 @@ Forward to a remote iroh service path in two modes.
 ```bash
 iroh-proxy forward <endpoint-id>/tcp/<service-name>
 iroh-proxy forward <listen-host:port> <endpoint-id>/tcp/<service-name>
+```
+
+In listen mode, close-on-request is enabled by default (2s). Override with:
+
+```bash
+iroh-proxy forward --close-on-request-timeout-secs <seconds> <listen-host:port> <endpoint-id>/tcp/<service-name>
 ```
 
 Examples:
@@ -218,10 +231,12 @@ target = "localhost:8000"
 [[forward.services]]
 listen = "127.0.0.1:11435"
 remote = "<endpoint-id>/tcp/ollama"
+close_on_request_timeout_secs = 2
 
 [[forward.services]]
 listen = "127.0.0.1:18000"
 remote = "<endpoint-id>/tcp/vllm"
+close_on_request_timeout_secs = 2
 ```
 
 Sections are optional:

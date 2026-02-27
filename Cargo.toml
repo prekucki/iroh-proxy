@@ -2,6 +2,14 @@
 name = "iroh-proxy"
 version = "0.1.0"
 edition = "2024"
+repository = "https://github.com/prekucki/iroh-proxy"
+authors = ["prekucki"]
+
+[package.metadata.wix]
+upgrade-guid = "1B4E2EF4-94F0-40DA-88A9-2FB23B0BAF8E"
+path-guid = "9AA904A2-6922-4388-A181-754AC31A4F1A"
+license = false
+eula = false
 
 [dependencies]
 anyhow = "1"
@@ -24,3 +32,9 @@ zbus = { version = "5", features = ["tokio", "p2p"] }
 [target.'cfg(windows)'.dependencies]
 uds_windows = "1"
 zbus = { version = "5", features = ["p2p"] }
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
+

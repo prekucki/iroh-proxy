@@ -11,7 +11,9 @@ target = "localhost:8000"
 [[forward.services]]
 listen = "127.0.0.1:11435"
 remote = "<endpoint-id>/tcp/ollama"
+close_on_request_timeout_secs = 2
 
 [[forward.services]]
 listen = "127.0.0.1:18000"
 remote = "<endpoint-id>/tcp/vllm"
+close_on_request_timeout_secs = 2

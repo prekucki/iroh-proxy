@@ -14,6 +14,8 @@ pub struct ServeService {
 pub struct ForwardService {
     pub listen: Box<str>,
     pub remote: Box<str>,
+    #[serde(default = "default_close_on_request_timeout_secs")]
+    pub close_on_request_timeout_secs: u64,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -30,6 +32,10 @@ pub struct ServeSection {
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct ForwardSection {
     pub services: Vec<ForwardService>,
+}
+
+fn default_close_on_request_timeout_secs() -> u64 {
+    2
 }
 
 pub fn default_config_path() -> PathBuf {
@@ -94,7 +100,12 @@ pub fn add_persistent_serve_rule(path: &Path, name: &str, target: &str) -> Resul
     write_config(path, &config)
 }
 
-pub fn add_persistent_forward_rule(path: &Path, listen: &str, remote: &str) -> Result<()> {
+pub fn add_persistent_forward_rule(
+    path: &Path,
+    listen: &str,
+    remote: &str,
+    close_on_request_timeout_secs: u64,
+) -> Result<()> {
     let mut config = load_config_or_default(path)?;
 
     let forward = config.forward.get_or_insert_with(ForwardSection::default);
@@ -103,20 +114,24 @@ pub fn add_persistent_forward_rule(path: &Path, listen: &str, remote: &str) -> R
         .iter()
         .find(|entry| entry.listen.as_ref() == listen)
     {
-        if existing.remote.as_ref() == remote {
+        if existing.remote.as_ref() == remote
+            && existing.close_on_request_timeout_secs == close_on_request_timeout_secs
+        {
             return Ok(());
         }
         anyhow::bail!(
-            "forward '{}' already exists in {} with remote '{}'",
+            "forward '{}' already exists in {} with remote '{}' and timeout {}s",
             listen,
             path.display(),
-            existing.remote
+            existing.remote,
+            existing.close_on_request_timeout_secs
         );
     }
 
     forward.services.push(ForwardService {
         listen: listen.into(),
         remote: remote.into(),
+        close_on_request_timeout_secs,
     });
     write_config(path, &config)
 }

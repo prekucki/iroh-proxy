@@ -43,6 +43,10 @@ pub enum Commands {
         #[arg(short = 'p', long)]
         persistent: bool,
 
+        /// Close iroh->tcp after this many seconds once tcp->iroh request upload EOF is reached
+        #[arg(long, default_value_t = 2)]
+        close_on_request_timeout_secs: u64,
+
         /// Local listen address in host:port form
         listen: String,
         /// Remote path in form: <node-id>/tcp/<name>
@@ -72,6 +76,10 @@ pub enum Commands {
     /// - One arg: stdio mode (useful for ssh ProxyCommand)
     /// - Two args: listen mode (<listen> <remote>)
     Forward {
+        /// Close iroh->tcp after this many seconds once tcp->iroh request upload EOF is reached
+        #[arg(long, default_value_t = 2)]
+        close_on_request_timeout_secs: u64,
+
         /// Remote path in form: <node-id>/tcp/<name> OR local bind when providing two args
         first: String,
 

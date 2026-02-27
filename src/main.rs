@@ -240,15 +240,22 @@ async fn main() -> Result<()> {
         }
         Commands::AddForward {
             persistent,
+            close_on_request_timeout_secs,
             listen,
             remote,
         } => {
             ensure_server_running(cli.key_file.as_deref(), &config_path).await?;
-            ctl_add_forward(&listen, &remote, persistent)
+            ctl_add_forward(&listen, &remote, persistent, close_on_request_timeout_secs)
                 .await
                 .with_context(|| "failed to add forward rule to running server")?;
             if persistent {
-                add_persistent_forward_rule(&config_path, &listen, &remote).with_context(|| {
+                add_persistent_forward_rule(
+                    &config_path,
+                    &listen,
+                    &remote,
+                    close_on_request_timeout_secs,
+                )
+                .with_context(|| {
                     format!(
                         "failed to persist forward rule to config {}",
                         config_path.display()
@@ -293,12 +300,17 @@ async fn main() -> Result<()> {
             println!("deleted serve: {name}");
             Ok(())
         }
-        Commands::Forward { first, second } => match second {
+        Commands::Forward {
+            close_on_request_timeout_secs,
+            first,
+            second,
+        } => match second {
             Some(remote) => {
                 let secret_key = load_or_create_forward_key(cli.key_file.as_deref())?;
                 let bindings = vec![ForwardBinding {
                     listen: first.into(),
                     remote: RemotePath::from_str(&remote)?,
+                    close_on_request_timeout: Duration::from_secs(close_on_request_timeout_secs),
                 }];
                 forward_bindings(secret_key, bindings).await
             }
@@ -321,6 +333,9 @@ async fn main() -> Result<()> {
                     listen: entry.listen,
                     remote: RemotePath::from_str(&entry.remote)
                         .with_context(|| format!("invalid remote path '{}'", entry.remote))?,
+                    close_on_request_timeout: Duration::from_secs(
+                        entry.close_on_request_timeout_secs,
+                    ),
                 });
             }
 
