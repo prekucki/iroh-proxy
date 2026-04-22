@@ -165,6 +165,26 @@ Example:
 iroh-proxy add-forward 127.0.0.1:5050 74f3645e8016bb34970c516acde5240e85ed4387dbe3aeb9189f50db5525bd76/tcp/app
 ```
 
+### `del-forward`
+
+Remove a forward rule from the running proxy server by its local listen address.
+
+```bash
+iroh-proxy del-forward <listen-host:port>
+```
+
+Use `-p` to also remove the matching rule from config (`[forward].services`):
+
+```bash
+iroh-proxy del-forward -p <listen-host:port>
+```
+
+Example:
+
+```bash
+iroh-proxy del-forward -p 127.0.0.1:11435
+```
+
 ### `forward`
 
 Forward to a remote iroh service path in two modes.
@@ -198,6 +218,30 @@ Host gpu-iroh
     User your-user
     ProxyCommand iroh-proxy forward 74f3645e8016bb34970c516acde5240e85ed4387dbe3aeb9189f50db5525bd76/tcp/ssh
 ```
+
+#### `--fdpass` (OpenSSH `ProxyUseFdpass yes`, Unix-only)
+
+With `--fdpass`, `iroh-proxy forward` follows OpenSSH's file-descriptor-passing
+convention instead of streaming bytes through stdio:
+
+1. it creates an `AF_UNIX` `SOCK_STREAM` socketpair,
+2. spawns a detached relay process holding one end (that end is what actually
+   talks to iroh),
+3. sends the other end back to `ssh` via `sendmsg(SCM_RIGHTS)` on stdout, then
+   exits so `ssh`'s `waitpid()` returns and it can use the passed socket.
+
+This avoids the extra hop through the parent process's pipes and hands ssh a
+real kernel socket.
+
+```sshconfig
+Host gpu-iroh
+    HostName ignored
+    User your-user
+    ProxyUseFdpass yes
+    ProxyCommand iroh-proxy forward --fdpass 74f3645e8016bb34970c516acde5240e85ed4387dbe3aeb9189f50db5525bd76/tcp/ssh
+```
+
+Only valid in single-argument (remote-only) form. Not available on Windows.
 
 ### `forward-config`
 

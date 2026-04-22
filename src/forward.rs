@@ -30,7 +30,7 @@ pub struct ForwardBinding {
     pub close_on_request_timeout: Duration,
 }
 
-async fn build_forward_endpoint(secret_key: SecretKey) -> Result<Endpoint> {
+pub(crate) async fn build_forward_endpoint(secret_key: SecretKey) -> Result<Endpoint> {
     let endpoint = Endpoint::empty_builder(RelayMode::Default)
         .secret_key(secret_key)
         .address_lookup(

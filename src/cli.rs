@@ -85,10 +85,23 @@ pub enum Commands {
     ///
     /// - One arg: stdio mode (useful for ssh ProxyCommand)
     /// - Two args: listen mode (<listen> <remote>)
+    /// - With `--fdpass`: OpenSSH `ProxyUseFdpass yes` mode; pass a
+    ///   connected socket back to ssh via SCM_RIGHTS on stdout and detach
+    ///   the iroh relay into a background process.
     Forward {
         /// Close iroh->tcp after this many seconds once tcp->iroh request upload EOF is reached
         #[arg(long, default_value_t = 2)]
         close_on_request_timeout_secs: u64,
+
+        /// OpenSSH ProxyUseFdpass mode: send a connected socket back to ssh
+        /// via SCM_RIGHTS on stdout, then exit (relay runs detached).
+        #[arg(long, conflicts_with = "fdpass_fd")]
+        fdpass: bool,
+
+        /// Internal: run as the detached fdpass relay child, reading/writing
+        /// on the given inherited file descriptor.
+        #[arg(long, hide = true, value_name = "FD")]
+        fdpass_fd: Option<i32>,
 
         /// Remote path in form: <node-id>/tcp/<name> OR local bind when providing two args
         first: String,

@@ -12,6 +12,8 @@ mod cli;
 mod config;
 mod control;
 mod daemon;
+#[cfg(unix)]
+mod fdpass;
 mod forward;
 mod keys;
 mod remote_path;
@@ -330,24 +332,60 @@ async fn main() -> Result<()> {
         }
         Commands::Forward {
             close_on_request_timeout_secs,
+            fdpass,
+            fdpass_fd,
             first,
             second,
-        } => match second {
-            Some(remote) => {
-                let secret_key = load_or_create_forward_key(cli.key_file.as_deref())?;
-                let bindings = vec![ForwardBinding {
-                    listen: first.into(),
-                    remote: RemotePath::from_str(&remote)?,
-                    close_on_request_timeout: Duration::from_secs(close_on_request_timeout_secs),
-                }];
-                forward_bindings(secret_key, bindings).await
-            }
-            None => {
+        } => {
+            #[cfg(unix)]
+            if let Some(fd) = fdpass_fd {
+                if second.is_some() {
+                    return Err(fdpass::fdpass_usage_error());
+                }
                 let secret_key = load_or_create_forward_key(cli.key_file.as_deref())?;
                 let remote = RemotePath::from_str(&first)?;
-                forward_stdio(secret_key, remote).await
+                return fdpass::run_fdpass_child(secret_key, remote, fd).await;
             }
-        },
+            #[cfg(not(unix))]
+            if fdpass_fd.is_some() {
+                bail!("--fdpass-fd is only supported on unix");
+            }
+
+            if fdpass {
+                #[cfg(unix)]
+                {
+                    if second.is_some() {
+                        return Err(fdpass::fdpass_usage_error());
+                    }
+                    // Validate remote before forking the relay child.
+                    RemotePath::from_str(&first)?;
+                    return fdpass::run_fdpass_parent(&first, cli.key_file.as_ref());
+                }
+                #[cfg(not(unix))]
+                {
+                    bail!("--fdpass is only supported on unix platforms");
+                }
+            }
+
+            match second {
+                Some(remote) => {
+                    let secret_key = load_or_create_forward_key(cli.key_file.as_deref())?;
+                    let bindings = vec![ForwardBinding {
+                        listen: first.into(),
+                        remote: RemotePath::from_str(&remote)?,
+                        close_on_request_timeout: Duration::from_secs(
+                            close_on_request_timeout_secs,
+                        ),
+                    }];
+                    forward_bindings(secret_key, bindings).await
+                }
+                None => {
+                    let secret_key = load_or_create_forward_key(cli.key_file.as_deref())?;
+                    let remote = RemotePath::from_str(&first)?;
+                    forward_stdio(secret_key, remote).await
+                }
+            }
+        }
         Commands::ForwardConfig { config } => {
             let secret_key = load_or_create_forward_key(cli.key_file.as_deref())?;
             let cfg = load_config(&config)?;

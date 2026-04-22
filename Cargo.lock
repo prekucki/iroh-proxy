@@ -1863,6 +1863,7 @@ dependencies = [
  "directories",
  "futures-util",
  "iroh",
+ "libc",
  "rand",
  "ratatui",
  "serde",

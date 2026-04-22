@@ -29,6 +29,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [target.'cfg(not(windows))'.dependencies]
 zbus = { version = "5", features = ["tokio", "p2p"] }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [target.'cfg(windows)'.dependencies]
 uds_windows = "1"
 zbus = { version = "5", features = ["p2p"] }
