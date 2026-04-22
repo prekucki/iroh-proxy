@@ -137,15 +137,26 @@ pub fn add_persistent_forward_rule(
 }
 
 pub fn remove_persistent_forward_rule(path: &Path, listen: &str, remote: &str) -> Result<bool> {
+    remove_persistent_forward_rule_inner(path, |entry| {
+        entry.listen.as_ref() == listen && entry.remote.as_ref() == remote
+    })
+}
+
+pub fn remove_persistent_forward_rule_by_listen(path: &Path, listen: &str) -> Result<bool> {
+    remove_persistent_forward_rule_inner(path, |entry| entry.listen.as_ref() == listen)
+}
+
+fn remove_persistent_forward_rule_inner(
+    path: &Path,
+    matches: impl Fn(&ForwardService) -> bool,
+) -> Result<bool> {
     let mut config = load_config_or_default(path)?;
     let Some(forward) = config.forward.as_mut() else {
         return Ok(false);
     };
 
     let initial_len = forward.services.len();
-    forward
-        .services
-        .retain(|entry| !(entry.listen.as_ref() == listen && entry.remote.as_ref() == remote));
+    forward.services.retain(|entry| !matches(entry));
     if forward.services.len() == initial_len {
         return Ok(false);
     }

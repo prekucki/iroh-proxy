@@ -295,3 +295,8 @@ pub async fn del_serve(name: &str) -> Result<()> {
     let client = ControlClient::connect().await?;
     client.del_serve(name).await
 }
+
+pub async fn del_forward(listen: &str) -> Result<()> {
+    let client = ControlClient::connect().await?;
+    client.del_forward(listen).await
+}

@@ -71,6 +71,16 @@ pub enum Commands {
         name: String,
     },
 
+    /// Remove a forward rule from the live proxy server
+    DelForward {
+        /// Also remove this forward rule from the config file
+        #[arg(short = 'p', long)]
+        persistent: bool,
+
+        /// Local listen address in host:port form (same one used with add-forward)
+        listen: String,
+    },
+
     /// Forward to a remote iroh endpoint path.
     ///
     /// - One arg: stdio mode (useful for ssh ProxyCommand)

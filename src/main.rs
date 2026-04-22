@@ -22,10 +22,11 @@ mod tui;
 use cli::{Cli, Commands};
 use config::{
     add_persistent_forward_rule, add_persistent_serve_rule, default_config_path, load_config,
-    load_config_or_default,
+    load_config_or_default, remove_persistent_forward_rule_by_listen,
 };
 use control::{
-    add_forward as ctl_add_forward, add_serve as ctl_add_serve, del_serve as ctl_del_serve,
+    add_forward as ctl_add_forward, add_serve as ctl_add_serve, del_forward as ctl_del_forward,
+    del_serve as ctl_del_serve,
 };
 use daemon::run_server;
 use forward::{ForwardBinding, forward_bindings, forward_stdio};
@@ -298,6 +299,33 @@ async fn main() -> Result<()> {
                 .await
                 .with_context(|| "failed to remove serve route from running server")?;
             println!("deleted serve: {name}");
+            Ok(())
+        }
+        Commands::DelForward { persistent, listen } => {
+            ctl_del_forward(&listen)
+                .await
+                .with_context(|| "failed to remove forward rule from running server")?;
+            println!("deleted forward: {listen}");
+            if persistent {
+                let removed = remove_persistent_forward_rule_by_listen(&config_path, &listen)
+                    .with_context(|| {
+                        format!(
+                            "failed to update persisted forwards in {}",
+                            config_path.display()
+                        )
+                    })?;
+                if removed {
+                    println!(
+                        "removed persisted forward in {}: {listen}",
+                        config_path.display()
+                    );
+                } else {
+                    println!(
+                        "no persisted forward matching '{listen}' in {}",
+                        config_path.display()
+                    );
+                }
+            }
             Ok(())
         }
         Commands::Forward {
