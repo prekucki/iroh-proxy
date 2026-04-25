@@ -106,6 +106,8 @@ Add a served TCP service route to the live proxy server.
 
 If the server is not running, `add-serve` starts it in the background.
 
+Service names must be 1-128 bytes and cannot contain `/`, whitespace, or control characters.
+
 ```bash
 iroh-proxy add-serve <service-name> <target-host:port>
 ```
@@ -327,6 +329,7 @@ Now local clients can use `127.0.0.1:11435` as if `ollama` were local on the ser
 ## Notes and limits
 
 - Supports only TCP forwarding paths in the form `<endpoint-id>/tcp/<name>`.
+- Service names are limited to 1-128 bytes and cannot contain `/`, whitespace, or control characters.
 - No authentication/authorization layer beyond iroh endpoint identity yet.
 - No encryption-termination or HTTP-aware features; this is raw TCP stream proxying.
 - Control API backend status:

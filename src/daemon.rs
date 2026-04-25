@@ -33,7 +33,7 @@ use crate::config::{ForwardService, ServeService};
 use crate::control::p2p_control_socket_path;
 use crate::control::{BUS_NAME, INTERFACE, OBJECT_PATH};
 use crate::forward::ForwardBinding;
-use crate::remote_path::{RemotePath, service_to_alpn};
+use crate::remote_path::{RemotePath, service_to_alpn, validate_service_name};
 #[cfg(target_os = "windows")]
 use uds_windows::{UnixListener as WindowsUnixListener, UnixStream as WindowsUnixStream};
 
@@ -731,9 +731,7 @@ async fn add_serve_route(
     name: &str,
     target: &str,
 ) -> Result<()> {
-    if name.trim().is_empty() {
-        bail!("service name cannot be empty");
-    }
+    validate_service_name(name).with_context(|| format!("invalid service name '{name}'"))?;
     if target.trim().is_empty() {
         bail!("target cannot be empty");
     }

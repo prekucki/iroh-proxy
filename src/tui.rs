@@ -943,13 +943,26 @@ async fn handle_add_service_key(
                 .await
                 .with_context(|| format!("failed to add service '{} -> {}'", name, target))?;
             if dialog.persist {
-                add_persistent_serve_rule(config_path, name, target).with_context(|| {
+                match add_persistent_serve_rule(config_path, name, target).with_context(|| {
                     format!(
                         "failed to persist service '{}' in {}",
                         name,
                         config_path.display()
                     )
-                })?;
+                }) {
+                    Ok(()) => {}
+                    Err(err) => {
+                        let err = match client.del_serve(name).await {
+                            Ok(()) => {
+                                err.context("rolled back runtime service after persistence failure")
+                            }
+                            Err(rollback_err) => err.context(format!(
+                                "failed to roll back runtime service after persistence failure: {rollback_err}"
+                            )),
+                        };
+                        return Err(err);
+                    }
+                }
             }
             let mut msg = format!("Added service: {name} -> {target}");
             if dialog.persist {
@@ -1018,13 +1031,28 @@ async fn handle_add_forward_key(
                 .await
                 .with_context(|| format!("failed to add forward '{} -> {}'", listen, remote))?;
             if dialog.persist {
-                add_persistent_forward_rule(config_path, listen, remote, 2).with_context(|| {
-                    format!(
-                        "failed to persist forward '{}' in {}",
-                        listen,
-                        config_path.display()
-                    )
-                })?;
+                match add_persistent_forward_rule(config_path, listen, remote, 2).with_context(
+                    || {
+                        format!(
+                            "failed to persist forward '{}' in {}",
+                            listen,
+                            config_path.display()
+                        )
+                    },
+                ) {
+                    Ok(()) => {}
+                    Err(err) => {
+                        let err = match client.del_forward(listen).await {
+                            Ok(()) => {
+                                err.context("rolled back runtime forward after persistence failure")
+                            }
+                            Err(rollback_err) => err.context(format!(
+                                "failed to roll back runtime forward after persistence failure: {rollback_err}"
+                            )),
+                        };
+                        return Err(err);
+                    }
+                }
             }
             let mut msg = format!("Added forward: {listen} -> {remote}");
             if dialog.persist {

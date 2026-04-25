@@ -252,7 +252,7 @@ async fn main() -> Result<()> {
                 .await
                 .with_context(|| "failed to add forward rule to running server")?;
             if persistent {
-                add_persistent_forward_rule(
+                if let Err(err) = add_persistent_forward_rule(
                     &config_path,
                     &listen,
                     &remote,
@@ -263,7 +263,17 @@ async fn main() -> Result<()> {
                         "failed to persist forward rule to config {}",
                         config_path.display()
                     )
-                })?;
+                }) {
+                    let err = match ctl_del_forward(&listen).await {
+                        Ok(()) => err.context(
+                            "rolled back runtime forward after persistence failure",
+                        ),
+                        Err(rollback_err) => err.context(format!(
+                            "failed to roll back runtime forward after persistence failure: {rollback_err}"
+                        )),
+                    };
+                    return Err(err);
+                }
                 println!(
                     "persisted forward rule in {}: {listen} -> {remote}",
                     config_path.display()
@@ -282,12 +292,24 @@ async fn main() -> Result<()> {
                 .await
                 .with_context(|| "failed to add serve route to running server")?;
             if persistent {
-                add_persistent_serve_rule(&config_path, &name, &target).with_context(|| {
-                    format!(
-                        "failed to persist serve rule to config {}",
-                        config_path.display()
-                    )
-                })?;
+                if let Err(err) = add_persistent_serve_rule(&config_path, &name, &target)
+                    .with_context(|| {
+                        format!(
+                            "failed to persist serve rule to config {}",
+                            config_path.display()
+                        )
+                    })
+                {
+                    let err = match ctl_del_serve(&name).await {
+                        Ok(()) => {
+                            err.context("rolled back runtime serve after persistence failure")
+                        }
+                        Err(rollback_err) => err.context(format!(
+                            "failed to roll back runtime serve after persistence failure: {rollback_err}"
+                        )),
+                    };
+                    return Err(err);
+                }
                 println!(
                     "persisted serve rule in {}: {name} -> {target}",
                     config_path.display()
