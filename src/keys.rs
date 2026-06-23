@@ -69,19 +69,22 @@ fn open_secret_key_for_create(path: &Path) -> std::io::Result<File> {
     options.open(path)
 }
 
+#[cfg(unix)]
 fn restrict_secret_key_permissions(path: &Path) -> Result<()> {
-    #[cfg(unix)]
-    {
-        let metadata = std::fs::metadata(path)
-            .with_context(|| format!("failed to inspect key file {}", path.display()))?;
-        let mut permissions = metadata.permissions();
-        let mode = permissions.mode() & 0o777;
-        if mode != 0o600 {
-            permissions.set_mode(0o600);
-            std::fs::set_permissions(path, permissions)
-                .with_context(|| format!("failed to restrict key file {}", path.display()))?;
-        }
+    let metadata = std::fs::metadata(path)
+        .with_context(|| format!("failed to inspect key file {}", path.display()))?;
+    let mut permissions = metadata.permissions();
+    let mode = permissions.mode() & 0o777;
+    if mode != 0o600 {
+        permissions.set_mode(0o600);
+        std::fs::set_permissions(path, permissions)
+            .with_context(|| format!("failed to restrict key file {}", path.display()))?;
     }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn restrict_secret_key_permissions(_path: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -166,6 +169,7 @@ mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    #[cfg(unix)]
     fn temp_key_path(name: &str) -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
