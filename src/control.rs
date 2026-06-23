@@ -3,6 +3,7 @@ use anyhow::{Context, Result, anyhow};
 use std::path::PathBuf;
 #[cfg(target_os = "macos")]
 use tokio::net::UnixStream;
+use tracing::{debug, warn};
 #[cfg(target_os = "windows")]
 use uds_windows::UnixStream as WindowsUnixStream;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -149,7 +150,12 @@ impl ControlClient {
     pub async fn status(&self) -> Result<Option<Status>> {
         let proxy = match self.proxy().await {
             Ok(proxy) => proxy,
-            Err(_) => return Ok(None),
+            Err(err) => {
+                // The transport connected but the interface proxy could not be
+                // built — unusual, so surface it rather than masking it.
+                warn!(error = %err, "failed to build control proxy; treating server as stopped");
+                return Ok(None);
+            }
         };
 
         let call: Result<(String, u64, u64, u64), zbus::Error> = proxy.call("Status", &()).await;
@@ -160,7 +166,12 @@ impl ControlClient {
                 served,
                 forwards,
             })),
-            Err(_) => Ok(None),
+            Err(err) => {
+                // Commonly "service not running"; log at debug so a broken-but-
+                // present daemon is still diagnosable with RUST_LOG=debug.
+                debug!(error = %err, "control Status call failed; treating server as stopped");
+                Ok(None)
+            }
         }
     }
 
@@ -264,7 +275,10 @@ impl ControlClient {
 pub async fn status() -> Result<Option<Status>> {
     let client = match ControlClient::connect().await {
         Ok(client) => client,
-        Err(_) => return Ok(None),
+        Err(err) => {
+            debug!(error = %err, "failed to connect to control plane; treating server as stopped");
+            return Ok(None);
+        }
     };
     client.status().await
 }

@@ -556,12 +556,16 @@ async fn get_or_connect_control_client(
 async fn fetch_snapshot(control_client: &mut Option<control::ControlClient>) -> Result<Snapshot> {
     let client = match get_or_connect_control_client(control_client).await {
         Ok(client) => client,
-        Err(_) => return Ok(Snapshot::default()),
+        Err(err) => {
+            tracing::debug!(error = %err, "control connect failed; rendering disconnected");
+            return Ok(Snapshot::default());
+        }
     };
 
     let status = match client.status().await {
         Ok(status) => status,
-        Err(_) => {
+        Err(err) => {
+            tracing::debug!(error = %err, "status query failed; rendering disconnected");
             *control_client = None;
             return Ok(Snapshot::default());
         }
@@ -573,21 +577,24 @@ async fn fetch_snapshot(control_client: &mut Option<control::ControlClient>) -> 
 
     let services = match client.list_serves().await {
         Ok(services) => services,
-        Err(_) => {
+        Err(err) => {
+            tracing::warn!(error = %err, "list_serves failed against a running daemon");
             *control_client = None;
             return Ok(Snapshot::default());
         }
     };
     let forwards = match client.list_forwards().await {
         Ok(forwards) => forwards,
-        Err(_) => {
+        Err(err) => {
+            tracing::warn!(error = %err, "list_forwards failed against a running daemon");
             *control_client = None;
             return Ok(Snapshot::default());
         }
     };
     let connections = match client.list_connections().await {
         Ok(connections) => connections,
-        Err(_) => {
+        Err(err) => {
+            tracing::warn!(error = %err, "list_connections failed against a running daemon");
             *control_client = None;
             return Ok(Snapshot::default());
         }
