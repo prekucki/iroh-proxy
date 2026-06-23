@@ -10,16 +10,12 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 use futures_util::StreamExt;
-use iroh::{
-    Endpoint, RelayMode, SecretKey,
-    address_lookup::{DhtAddressLookup, MdnsAddressLookup},
-};
-use tokio::io;
+use iroh::{Endpoint, SecretKey};
 use tokio::net::{TcpListener, TcpStream};
 #[cfg(target_os = "macos")]
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, RwLock, mpsc::UnboundedSender};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use tracing::{error, info, warn};
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 use zbus::Connection;
@@ -33,6 +29,7 @@ use crate::config::{ForwardService, ServeService};
 use crate::control::p2p_control_socket_path;
 use crate::control::{BUS_NAME, INTERFACE, OBJECT_PATH};
 use crate::forward::ForwardBinding;
+use crate::proxy::{build_endpoint, connect_remote, pump_streams};
 use crate::remote_path::{RemotePath, service_to_alpn, validate_service_name};
 #[cfg(target_os = "windows")]
 use uds_windows::{UnixListener as WindowsUnixListener, UnixStream as WindowsUnixStream};
@@ -79,17 +76,6 @@ impl Drop for ActiveConnGuard {
         map.remove(&self.id);
         let _ = self.state_tx.send("connection-closed".into());
     }
-}
-
-fn is_disconnect(err: &std::io::Error) -> bool {
-    matches!(
-        err.kind(),
-        std::io::ErrorKind::BrokenPipe
-            | std::io::ErrorKind::ConnectionReset
-            | std::io::ErrorKind::ConnectionAborted
-            | std::io::ErrorKind::UnexpectedEof
-            | std::io::ErrorKind::NotConnected
-    )
 }
 
 #[derive(Clone)]
@@ -564,13 +550,7 @@ pub async fn run_server(
     initial_services: Vec<ServeService>,
     initial_forwards: Vec<ForwardService>,
 ) -> Result<()> {
-    let endpoint = Endpoint::empty_builder(RelayMode::Default)
-        .secret_key(secret_key)
-        .address_lookup(DhtAddressLookup::builder().n0_dns_pkarr_relay())
-        .address_lookup(MdnsAddressLookup::builder())
-        .bind()
-        .await?;
-    endpoint.online().await;
+    let endpoint = build_endpoint(secret_key, true).await?;
 
     let routes = Arc::new(RwLock::new(HashMap::<Vec<u8>, Route>::new()));
     let forwards = Arc::new(Mutex::new(HashMap::<Box<str>, ForwardRuntime>::new()));
@@ -674,7 +654,7 @@ pub async fn run_server(
     let active_for_accept = Arc::clone(&active_connections);
     let next_conn_id_for_accept = Arc::clone(&next_conn_id);
     let state_tx_for_accept = state_tx.clone();
-    tokio::spawn(async move {
+    let mut accept_handle = tokio::spawn(async move {
         loop {
             let incoming = match endpoint.accept().await {
                 Some(incoming) => incoming,
@@ -721,9 +701,71 @@ pub async fn run_server(
         }
     });
 
-    std::future::pending::<()>().await;
-    #[allow(unreachable_code)]
-    Ok(())
+    tokio::select! {
+        res = &mut accept_handle => {
+            match res {
+                Ok(()) => warn!("accept loop ended; iroh endpoint closed"),
+                Err(err) => error!(error = %err, "accept loop task failed"),
+            }
+            cleanup_control_socket();
+            bail!("iroh endpoint closed; shutting down server");
+        }
+        _ = shutdown_signal() => {
+            info!("shutdown signal received; stopping iroh-proxy server");
+            accept_handle.abort();
+            cleanup_control_socket();
+            Ok(())
+        }
+    }
+}
+
+/// Resolve when the process should shut down (SIGTERM/SIGINT on unix, Ctrl-C
+/// elsewhere).
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut term = match signal(SignalKind::terminate()) {
+            Ok(sig) => sig,
+            Err(err) => {
+                warn!(error = %err, "failed to install SIGTERM handler");
+                return std::future::pending().await;
+            }
+        };
+        let mut interrupt = match signal(SignalKind::interrupt()) {
+            Ok(sig) => sig,
+            Err(err) => {
+                warn!(error = %err, "failed to install SIGINT handler");
+                return std::future::pending().await;
+            }
+        };
+        tokio::select! {
+            _ = term.recv() => {}
+            _ = interrupt.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+/// Remove the p2p control socket on shutdown (macOS/Windows). No-op on Linux,
+/// which uses the DBus session bus rather than a socket file.
+fn cleanup_control_socket() {
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    {
+        let path = p2p_control_socket_path();
+        match std::fs::remove_file(&path) {
+            Ok(()) => info!(socket = %path.display(), "removed control socket"),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => warn!(
+                error = %err,
+                socket = %path.display(),
+                "failed to remove control socket on shutdown"
+            ),
+        }
+    }
 }
 
 async fn add_serve_route(
@@ -770,47 +812,54 @@ async fn add_forward_binding(
         .with_context(|| format!("failed to bind local listener {}", binding.listen))?;
     let listen = binding.listen.clone();
     let remote = binding.remote.clone();
-    let alpn = remote.to_alpn();
     let close_on_request_timeout = binding.close_on_request_timeout;
     let state_tx_for_task = state_tx.clone();
 
     let task = tokio::spawn(async move {
+        // Track per-connection tasks so that aborting this listener task (on
+        // del-forward / ForwardRuntime::Drop) also tears down in-flight
+        // connections: dropping the JoinSet aborts every task it holds.
+        let mut conns: JoinSet<()> = JoinSet::new();
         loop {
-            let (inbound, peer_addr) = match listener.accept().await {
-                Ok(pair) => pair,
-                Err(err) => {
-                    error!(error = %err, listen = %listen, "forward listener accept failed");
-                    return;
-                }
-            };
+            tokio::select! {
+                accepted = listener.accept() => {
+                    let (inbound, peer_addr) = match accepted {
+                        Ok(pair) => pair,
+                        Err(err) => {
+                            error!(error = %err, listen = %listen, "forward listener accept failed");
+                            return;
+                        }
+                    };
 
-            let endpoint = endpoint.clone();
-            let remote = remote.clone();
-            let alpn = alpn.clone();
-            let conn_state = ForwardConnState {
-                active_connections: Arc::clone(&active_connections),
-                next_conn_id: Arc::clone(&next_conn_id),
-                state_tx: state_tx_for_task.clone(),
-            };
-            tokio::spawn(async move {
-                if let Err(err) = handle_forward_conn(
-                    endpoint,
-                    inbound,
-                    remote,
-                    alpn,
-                    close_on_request_timeout,
-                    conn_state,
-                )
-                .await
-                {
-                    warn!(
-                        target: "iroh_proxy::forward",
-                        peer = %peer_addr,
-                        error = %err,
-                        "forwarding connection failed"
-                    );
+                    let endpoint = endpoint.clone();
+                    let remote = remote.clone();
+                    let conn_state = ForwardConnState {
+                        active_connections: Arc::clone(&active_connections),
+                        next_conn_id: Arc::clone(&next_conn_id),
+                        state_tx: state_tx_for_task.clone(),
+                    };
+                    conns.spawn(async move {
+                        if let Err(err) = handle_forward_conn(
+                            endpoint,
+                            inbound,
+                            remote,
+                            close_on_request_timeout,
+                            conn_state,
+                        )
+                        .await
+                        {
+                            warn!(
+                                target: "iroh_proxy::forward",
+                                peer = %peer_addr,
+                                error = %err,
+                                "forwarding connection failed"
+                            );
+                        }
+                    });
                 }
-            });
+                // Reap finished connection tasks to bound memory.
+                Some(_joined) = conns.join_next(), if !conns.is_empty() => {}
+            }
         }
     });
 
@@ -845,7 +894,7 @@ async fn handle_incoming(
             )
         })?
     };
-    warn!(
+    info!(
         peer = %conn.remote_id(),
         service = %route.name,
         "accepted incoming connection"
@@ -861,16 +910,20 @@ async fn handle_incoming(
             dst: route.name.clone(),
         },
     );
-    let (mut send, mut recv) = conn.accept_bi().await?;
+    let (send, recv) = conn.accept_bi().await?;
     let local = TcpStream::connect(&*route.target)
         .await
         .with_context(|| format!("failed to connect local target {}", route.target))?;
-    let (mut local_read, mut local_write) = local.into_split();
+    let (local_read, local_write) = local.into_split();
 
-    let to_local = io::copy(&mut recv, &mut local_write);
-    let to_remote = io::copy(&mut local_read, &mut send);
-    let _ = tokio::try_join!(to_local, to_remote)?;
-    send.finish()?;
+    // serve: up = target->iroh (response), down = iroh->target (request).
+    // Per-direction half-close (no close-on-request timeout on the serve side).
+    pump_streams(local_read, local_write, send, recv, None).await?;
+
+    // Let the requester drive the connection close so the final response bytes
+    // are delivered before teardown (an eager drop here would truncate them).
+    // Bounded by the connection idle timeout if the peer never closes.
+    conn.closed().await;
     Ok(())
 }
 
@@ -878,7 +931,6 @@ async fn handle_forward_conn(
     endpoint: Endpoint,
     inbound: TcpStream,
     remote: RemotePath,
-    alpn: Vec<u8>,
     close_on_request_timeout: Duration,
     conn_state: ForwardConnState,
 ) -> Result<()> {
@@ -895,12 +947,7 @@ async fn handle_forward_conn(
         service = %service,
         "forwarding connection"
     );
-    let conn = endpoint.connect(remote_id, &alpn).await.with_context(|| {
-        format!(
-            "failed connecting to remote endpoint {} (discovery failed via local mDNS and pkarr)",
-            remote_id
-        )
-    })?;
+    let conn = connect_remote(&endpoint, &remote).await?;
     let _guard = register_connection(
         Arc::clone(&conn_state.active_connections),
         Arc::clone(&conn_state.next_conn_id),
@@ -911,7 +958,7 @@ async fn handle_forward_conn(
             dst: format!("{}/tcp/{}", remote_id, service).into(),
         },
     );
-    let (mut send, mut recv) = conn.open_bi().await?;
+    let (send, recv) = conn.open_bi().await?;
     info!(
         target: "iroh_proxy::forward",
         src = %src,
@@ -919,123 +966,40 @@ async fn handle_forward_conn(
         service = %service,
         "forward stream established"
     );
-    let (mut inbound_read, mut inbound_write) = inbound.into_split();
-    let src_to_remote = src.clone();
-    let service_to_remote = service.clone();
+    let (inbound_read, inbound_write) = inbound.into_split();
+    let result = pump_streams(
+        inbound_read,
+        inbound_write,
+        send,
+        recv,
+        Some(close_on_request_timeout),
+    )
+    .await;
 
-    let to_remote = async {
-        let bytes = match io::copy(&mut inbound_read, &mut send).await {
-            Ok(bytes) => bytes,
-            Err(err) => {
-                if is_disconnect(&err) {
-                    warn!(
-                        target: "iroh_proxy::forward",
-                        src = %src_to_remote,
-                        remote = %remote_id,
-                        service = %service_to_remote,
-                        error = %err,
-                        "forward tcp->iroh disconnected"
-                    );
-                } else {
-                    warn!(
-                        target: "iroh_proxy::forward",
-                        src = %src_to_remote,
-                        remote = %remote_id,
-                        service = %service_to_remote,
-                        error = %err,
-                        "forward tcp->iroh copy failed"
-                    );
-                }
-                return Err(err.into());
-            }
-        };
+    // Guarantee teardown on every exit path (especially the timeout path).
+    conn.close(0u32.into(), b"closed");
+
+    let stats = result?;
+    if stats.timed_out {
+        warn!(
+            target: "iroh_proxy::forward",
+            src = %src,
+            remote = %remote_id,
+            service = %service,
+            timeout_secs = close_on_request_timeout.as_secs_f64(),
+            "forward close-on-request timeout reached; connection closed"
+        );
+    } else {
         info!(
             target: "iroh_proxy::forward",
-            src = %src_to_remote,
+            src = %src,
             remote = %remote_id,
-            service = %service_to_remote,
-            bytes,
-            "forward tcp->iroh completed"
+            service = %service,
+            up_bytes = stats.up_bytes,
+            down_bytes = stats.down_bytes,
+            "forwarding finished"
         );
-        if let Err(err) = send.finish() {
-            warn!(
-                target: "iroh_proxy::forward",
-                src = %src_to_remote,
-                remote = %remote_id,
-                service = %service_to_remote,
-                error = %err,
-                "forward failed to half-close iroh send stream"
-            );
-        } else {
-            info!(
-                target: "iroh_proxy::forward",
-                src = %src_to_remote,
-                remote = %remote_id,
-                service = %service_to_remote,
-                "forward half-closed iroh send stream"
-            );
-        }
-        Ok::<(), anyhow::Error>(())
-    };
-    let src_to_local = src.clone();
-    let service_to_local = service.clone();
-    let to_local = tokio::spawn(async move {
-        let bytes = match io::copy(&mut recv, &mut inbound_write).await {
-            Ok(bytes) => bytes,
-            Err(err) => {
-                if is_disconnect(&err) {
-                    warn!(
-                        target: "iroh_proxy::forward",
-                        src = %src_to_local,
-                        remote = %remote_id,
-                        service = %service_to_local,
-                        error = %err,
-                        "forward iroh->tcp disconnected"
-                    );
-                } else {
-                    warn!(
-                        target: "iroh_proxy::forward",
-                        src = %src_to_local,
-                        remote = %remote_id,
-                        service = %service_to_local,
-                        error = %err,
-                        "forward iroh->tcp copy failed"
-                    );
-                }
-                return Err(err.into());
-            }
-        };
-        info!(
-            target: "iroh_proxy::forward",
-            src = %src_to_local,
-            remote = %remote_id,
-            service = %service_to_local,
-            bytes,
-            "forward iroh->tcp completed"
-        );
-        Ok::<(), anyhow::Error>(())
-    });
-    to_remote.await?;
-    match tokio::time::timeout(close_on_request_timeout, to_local).await {
-        Ok(joined) => joined??,
-        Err(_) => {
-            warn!(
-                target: "iroh_proxy::forward",
-                src = %src,
-                remote = %remote_id,
-                service = %service,
-                timeout_secs = close_on_request_timeout.as_secs_f64(),
-                "forward close-on-request timeout reached; closing connection"
-            );
-        }
     }
-    info!(
-        target: "iroh_proxy::forward",
-        src = %src,
-        remote = %remote_id,
-        service = %service,
-        "forwarding finished"
-    );
     Ok(())
 }
 
@@ -1063,5 +1027,84 @@ fn register_connection(
 impl Drop for ForwardRuntime {
     fn drop(&mut self) {
         self.task.abort();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_conn(tag: &str) -> ActiveConnection {
+        ActiveConnection {
+            src: tag.into(),
+            kind: "test".into(),
+            dst: tag.into(),
+        }
+    }
+
+    #[test]
+    fn register_connection_tracks_inserts_and_guard_drop_removes() {
+        let active = Arc::new(StdMutex::new(HashMap::<u64, ActiveConnection>::new()));
+        let next_id = Arc::new(AtomicU64::new(1));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Box<str>>();
+
+        let g1 = register_connection(
+            Arc::clone(&active),
+            Arc::clone(&next_id),
+            tx.clone(),
+            sample_conn("a"),
+        );
+        let g2 = register_connection(
+            Arc::clone(&active),
+            Arc::clone(&next_id),
+            tx.clone(),
+            sample_conn("b"),
+        );
+
+        assert_eq!(active.lock().unwrap().len(), 2);
+        assert!(
+            g1.id < g2.id,
+            "connection ids must be monotonically increasing"
+        );
+        assert_eq!(rx.try_recv().unwrap().as_ref(), "connection-opened");
+        assert_eq!(rx.try_recv().unwrap().as_ref(), "connection-opened");
+
+        drop(g1);
+        assert_eq!(active.lock().unwrap().len(), 1);
+        assert_eq!(rx.try_recv().unwrap().as_ref(), "connection-closed");
+
+        drop(g2);
+        assert_eq!(active.lock().unwrap().len(), 0);
+        assert_eq!(rx.try_recv().unwrap().as_ref(), "connection-closed");
+    }
+
+    #[test]
+    fn register_connection_recovers_from_a_poisoned_lock() {
+        let active = Arc::new(StdMutex::new(HashMap::<u64, ActiveConnection>::new()));
+        let next_id = Arc::new(AtomicU64::new(1));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<Box<str>>();
+
+        // Poison the mutex by panicking while holding the guard.
+        let poison_target = Arc::clone(&active);
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = poison_target.lock().unwrap();
+            panic!("intentional poison");
+        }));
+        std::panic::set_hook(prev_hook);
+        assert!(active.is_poisoned());
+
+        // register_connection / guard Drop both use unwrap_or_else(into_inner),
+        // so they must keep working despite the poison.
+        let guard = register_connection(
+            Arc::clone(&active),
+            Arc::clone(&next_id),
+            tx,
+            sample_conn("a"),
+        );
+        assert_eq!(active.lock().unwrap_or_else(|p| p.into_inner()).len(), 1);
+        drop(guard);
+        assert_eq!(active.lock().unwrap_or_else(|p| p.into_inner()).len(), 0);
     }
 }

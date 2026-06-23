@@ -36,6 +36,11 @@ Run the long-lived proxy server that exposes a platform-native control API.
 iroh-proxy server
 ```
 
+The server shuts down gracefully on `SIGTERM`/`SIGINT` (Ctrl-C on Windows) and
+removes its control socket on exit (macOS/Windows). If the underlying iroh
+endpoint closes, the process exits with a non-zero status so a supervisor
+(systemd, launchd) can restart it instead of leaving a live-but-dead process.
+
 Install a user systemd unit:
 
 ```bash
@@ -170,6 +175,8 @@ iroh-proxy add-forward 127.0.0.1:5050 74f3645e8016bb34970c516acde5240e85ed4387db
 ### `del-forward`
 
 Remove a forward rule from the running proxy server by its local listen address.
+This stops the listener and also tears down any of its still-open forwarded
+connections (it no longer leaves in-flight tunnels running in the background).
 
 ```bash
 iroh-proxy del-forward <listen-host:port>
