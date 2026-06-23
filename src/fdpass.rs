@@ -21,9 +21,8 @@ use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result};
 use iroh::SecretKey;
-use tokio::io::{self, AsyncWriteExt};
 
-use crate::forward::build_forward_endpoint;
+use crate::proxy::{build_endpoint, connect_remote, pump_streams};
 use crate::remote_path::RemotePath;
 
 /// Parent side: invoked by ssh. Create a socketpair, spawn a detached child
@@ -96,32 +95,15 @@ pub async fn run_fdpass_child(
     let stream = tokio::net::UnixStream::from_std(std_stream)
         .context("failed to register inherited fd with tokio")?;
 
-    let alpn = remote.to_alpn();
-    let endpoint = build_forward_endpoint(secret_key).await?;
-    let conn = endpoint
-        .connect(remote.endpoint_id, &alpn)
-        .await
-        .with_context(|| {
-            format!(
-                "failed connecting to remote endpoint {} (discovery failed via local mDNS and pkarr)",
-                remote.endpoint_id
-            )
-        })?;
-    let (mut send, mut recv) = conn.open_bi().await?;
+    let endpoint = build_endpoint(secret_key, false).await?;
+    let conn = connect_remote(&endpoint, &remote).await?;
+    let (send, recv) = conn.open_bi().await?;
 
-    let (mut local_read, mut local_write) = stream.into_split();
-
-    let up = async {
-        let _ = io::copy(&mut local_read, &mut send).await?;
-        let _ = send.finish();
-        Ok::<(), anyhow::Error>(())
-    };
-    let down = async {
-        let _ = io::copy(&mut recv, &mut local_write).await?;
-        local_write.shutdown().await.ok();
-        Ok::<(), anyhow::Error>(())
-    };
-    let _ = tokio::try_join!(up, down)?;
+    let (local_read, local_write) = stream.into_split();
+    // fdpass relay: run both directions to completion (no close-on-request timeout).
+    let result = pump_streams(local_read, local_write, send, recv, None).await;
+    conn.close(0u32.into(), b"closed");
+    result?;
     Ok(())
 }
 

@@ -16,6 +16,7 @@ mod daemon;
 mod fdpass;
 mod forward;
 mod keys;
+mod proxy;
 mod remote_path;
 #[cfg(target_os = "linux")]
 mod systemd;
