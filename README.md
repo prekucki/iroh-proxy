@@ -260,6 +260,15 @@ Bind multiple local listeners from `config.toml`.
 iroh-proxy forward-config ./config.toml
 ```
 
+### `version`
+
+Print version and build metadata.
+
+```bash
+iroh-proxy version
+iroh-proxy version --short
+```
+
 ## Config file
 
 Default config path:

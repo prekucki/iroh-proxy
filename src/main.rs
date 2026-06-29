@@ -21,6 +21,7 @@ mod remote_path;
 #[cfg(target_os = "linux")]
 mod systemd;
 mod tui;
+mod version;
 
 use cli::{Cli, Commands};
 use config::{
@@ -429,6 +430,14 @@ async fn main() -> Result<()> {
             }
 
             forward_bindings(secret_key, bindings).await
+        }
+        Commands::Version { short } => {
+            if short {
+                println!("{}", version::short_version());
+            } else {
+                version::print_detailed();
+            }
+            Ok(())
         }
     }
 }

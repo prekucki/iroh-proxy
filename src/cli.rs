@@ -115,4 +115,11 @@ pub enum Commands {
         /// Path to config.toml
         config: PathBuf,
     },
+
+    /// Print detailed version and build information
+    Version {
+        /// Print only the short version string
+        #[arg(long)]
+        short: bool,
+    },
 }
