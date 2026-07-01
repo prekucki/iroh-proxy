@@ -209,6 +209,12 @@ In listen mode, close-on-request is enabled by default (2s). Override with:
 iroh-proxy forward --close-on-request-timeout-secs <seconds> <listen-host:port> <endpoint-id>/tcp/<service-name>
 ```
 
+Connecting to the remote endpoint retries transient failures with exponential
+backoff (4 attempts over ~3.5s) before giving up. This applies to every
+forward mode (stdio, listener, `--fdpass`, and daemon-managed `add-forward`
+rules) and covers connection establishment only — an established stream that
+breaks is not resumed.
+
 Examples:
 
 ```bash

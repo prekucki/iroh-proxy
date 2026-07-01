@@ -1,13 +1,17 @@
 //! Shared forwarding core.
 //!
-//! This module single-sources the three things that used to be duplicated
-//! between the daemon and the standalone `forward` paths:
+//! This module single-sources what used to be duplicated between the daemon
+//! and the standalone `forward` paths:
 //!
 //! - [`build_endpoint`]: iroh `Endpoint` construction (server publishes, client
 //!   does not).
-//! - [`connect_remote`]: connecting to a remote service path.
+//! - [`connect_remote`] / [`connect_remote_with_retry`]: connecting to a remote
+//!   service path, the latter with exponential backoff for transient failures.
 //! - [`pump_streams`]: the bidirectional copy with per-direction half-close and
 //!   an optional close-on-request timeout.
+//! - [`forward_tcp_conn`]: the full per-connection forward flow (connect with
+//!   retry, open stream, pump, teardown), shared by the daemon and the
+//!   standalone listener.
 //!
 //! [`pump_streams`] is generic over [`AsyncRead`]/[`AsyncWrite`] so it can be
 //! unit-tested with [`tokio::io::duplex`] without standing up a network. The
@@ -76,9 +80,88 @@ pub async fn connect_remote(
         })
 }
 
-/// Forward one accepted local TCP connection to a remote service: connect,
-/// open a bi-stream, pump until EOF/timeout, and close the iroh connection on
-/// every exit path.
+/// Retry policy for establishing the remote connection: exponential backoff,
+/// no jitter (attempts are few and this is a single-user tool).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetryPolicy {
+    /// Total connect attempts, including the first. `1` disables retrying.
+    pub max_attempts: u32,
+    /// Wait before the second attempt; doubles per retry up to `max_backoff`.
+    pub initial_backoff: Duration,
+    pub max_backoff: Duration,
+}
+
+impl Default for RetryPolicy {
+    /// 4 attempts over ~3.5s (0.5s + 1s + 2s) — long enough to ride out a
+    /// discovery blip, short enough that a waiting local client (or ssh via
+    /// ProxyCommand) sees a timely failure when the remote is really gone.
+    fn default() -> Self {
+        Self {
+            max_attempts: 4,
+            initial_backoff: Duration::from_millis(500),
+            max_backoff: Duration::from_secs(5),
+        }
+    }
+}
+
+fn next_backoff(current: Duration, max: Duration) -> Duration {
+    current.saturating_mul(2).min(max)
+}
+
+/// Run `attempt_fn` until it succeeds or `policy.max_attempts` is exhausted,
+/// sleeping with exponential backoff between attempts.
+async fn retry_with_backoff<T, Fut>(
+    policy: RetryPolicy,
+    what: &str,
+    mut attempt_fn: impl FnMut() -> Fut,
+) -> Result<T>
+where
+    Fut: Future<Output = Result<T>>,
+{
+    let mut backoff = policy.initial_backoff;
+    let mut attempt = 1u32;
+    loop {
+        match attempt_fn().await {
+            Ok(value) => return Ok(value),
+            Err(err) if attempt < policy.max_attempts => {
+                warn!(
+                    attempt,
+                    max_attempts = policy.max_attempts,
+                    backoff_ms = backoff.as_millis() as u64,
+                    error = %format!("{err:#}"),
+                    "{} failed; retrying",
+                    what
+                );
+                tokio::time::sleep(backoff).await;
+                backoff = next_backoff(backoff, policy.max_backoff);
+                attempt += 1;
+            }
+            Err(err) if attempt > 1 => {
+                return Err(err)
+                    .with_context(|| format!("{what}: giving up after {attempt} attempts"));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+/// [`connect_remote`] with retry/backoff. Only connection establishment is
+/// retried — an established stream that later breaks cannot be resumed,
+/// because bytes already handed to the local side would be lost.
+pub async fn connect_remote_with_retry(
+    endpoint: &Endpoint,
+    remote: &RemotePath,
+    policy: RetryPolicy,
+) -> Result<iroh::endpoint::Connection> {
+    retry_with_backoff(policy, "remote connect", || {
+        connect_remote(endpoint, remote)
+    })
+    .await
+}
+
+/// Forward one accepted local TCP connection to a remote service: connect
+/// (with the default retry policy), open a bi-stream, pump until EOF/timeout,
+/// and close the iroh connection on every exit path.
 ///
 /// `register` is called with the peer address once the remote connection is
 /// established; whatever it returns is held until the transfer finishes. The
@@ -103,7 +186,7 @@ pub async fn forward_tcp_conn<G>(
         service = %remote.service,
         "forwarding connection"
     );
-    let conn = connect_remote(endpoint, remote).await?;
+    let conn = connect_remote_with_retry(endpoint, remote, RetryPolicy::default()).await?;
     let _guard = register(&src);
     let (send, recv) = conn.open_bi().await?;
     info!(
@@ -359,6 +442,100 @@ mod tests {
             .unwrap();
         assert!(stats.timed_out, "expected the timeout branch to fire");
         assert_eq!(stats.up_bytes, 3);
+    }
+
+    fn tiny_retry_policy(max_attempts: u32) -> RetryPolicy {
+        RetryPolicy {
+            max_attempts,
+            initial_backoff: Duration::from_millis(1),
+            max_backoff: Duration::from_millis(2),
+        }
+    }
+
+    #[test]
+    fn next_backoff_doubles_and_caps() {
+        let max = Duration::from_secs(5);
+        let mut backoff = Duration::from_millis(500);
+        let mut seen = Vec::new();
+        for _ in 0..5 {
+            backoff = next_backoff(backoff, max);
+            seen.push(backoff);
+        }
+        assert_eq!(
+            seen,
+            vec![
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+                Duration::from_secs(4),
+                Duration::from_secs(5),
+                Duration::from_secs(5),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_succeeds_without_retrying_when_first_attempt_is_ok() {
+        let calls = std::cell::Cell::new(0u32);
+        let result = retry_with_backoff(tiny_retry_policy(4), "test op", || {
+            calls.set(calls.get() + 1);
+            async { Ok::<_, anyhow::Error>(42) }
+        })
+        .await
+        .unwrap();
+        assert_eq!(result, 42);
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[tokio::test]
+    async fn retry_recovers_from_transient_failures() {
+        let calls = std::cell::Cell::new(0u32);
+        let result = retry_with_backoff(tiny_retry_policy(4), "test op", || {
+            calls.set(calls.get() + 1);
+            let n = calls.get();
+            async move {
+                if n < 3 {
+                    Err(anyhow::anyhow!("transient failure {n}"))
+                } else {
+                    Ok(n)
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(result, 3, "must succeed on the third attempt");
+        assert_eq!(calls.get(), 3);
+    }
+
+    #[tokio::test]
+    async fn retry_gives_up_after_max_attempts() {
+        let calls = std::cell::Cell::new(0u32);
+        let err = retry_with_backoff(tiny_retry_policy(3), "test op", || {
+            calls.set(calls.get() + 1);
+            async { Err::<(), _>(anyhow::anyhow!("permanent failure")) }
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(calls.get(), 3, "must stop at max_attempts");
+        assert!(
+            format!("{err:#}").contains("giving up after 3 attempts"),
+            "error must say how many attempts were made: {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_disabled_with_single_attempt_returns_plain_error() {
+        let calls = std::cell::Cell::new(0u32);
+        let err = retry_with_backoff(tiny_retry_policy(1), "test op", || {
+            calls.set(calls.get() + 1);
+            async { Err::<(), _>(anyhow::anyhow!("root cause")) }
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(calls.get(), 1);
+        assert!(
+            !format!("{err:#}").contains("giving up"),
+            "single-attempt failure must not claim retries happened: {err:#}"
+        );
     }
 
     #[test]

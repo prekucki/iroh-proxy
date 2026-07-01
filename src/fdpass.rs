@@ -22,7 +22,7 @@ use std::process::{Command, Stdio};
 use anyhow::{Context, Result};
 use iroh::SecretKey;
 
-use crate::proxy::{build_endpoint, connect_remote, pump_streams};
+use crate::proxy::{RetryPolicy, build_endpoint, connect_remote_with_retry, pump_streams};
 use crate::remote_path::RemotePath;
 
 /// Parent side: invoked by ssh. Create a socketpair, spawn a detached child
@@ -96,7 +96,7 @@ pub async fn run_fdpass_child(
         .context("failed to register inherited fd with tokio")?;
 
     let endpoint = build_endpoint(secret_key, false).await?;
-    let conn = connect_remote(&endpoint, &remote).await?;
+    let conn = connect_remote_with_retry(&endpoint, &remote, RetryPolicy::default()).await?;
     let (send, recv) = conn.open_bi().await?;
 
     let (local_read, local_write) = stream.into_split();

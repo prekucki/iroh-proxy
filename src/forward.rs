@@ -5,7 +5,9 @@ use tokio::io;
 use tokio::net::TcpListener;
 use tracing::{info, warn};
 
-use crate::proxy::{build_endpoint, connect_remote, forward_tcp_conn, pump_streams};
+use crate::proxy::{
+    RetryPolicy, build_endpoint, connect_remote_with_retry, forward_tcp_conn, pump_streams,
+};
 use crate::remote_path::RemotePath;
 
 #[derive(Debug, Clone)]
@@ -17,7 +19,7 @@ pub struct ForwardBinding {
 
 pub async fn forward_stdio(secret_key: SecretKey, remote: RemotePath) -> Result<()> {
     let endpoint = build_endpoint(secret_key, false).await?;
-    let conn = connect_remote(&endpoint, &remote).await?;
+    let conn = connect_remote_with_retry(&endpoint, &remote, RetryPolicy::default()).await?;
     let (send, recv) = conn.open_bi().await?;
 
     // stdio mode: run both directions to completion (no close-on-request timeout).
