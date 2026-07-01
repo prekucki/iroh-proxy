@@ -22,8 +22,9 @@ use iroh::{
     address_lookup::{DhtAddressLookup, MdnsAddressLookup},
 };
 use tokio::io::{self, AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::remote_path::RemotePath;
 
@@ -73,6 +74,82 @@ pub async fn connect_remote(
                 remote.endpoint_id
             )
         })
+}
+
+/// Forward one accepted local TCP connection to a remote service: connect,
+/// open a bi-stream, pump until EOF/timeout, and close the iroh connection on
+/// every exit path.
+///
+/// `register` is called with the peer address once the remote connection is
+/// established; whatever it returns is held until the transfer finishes. The
+/// daemon passes a closure that registers the connection in its live registry
+/// (the guard's `Drop` unregisters it); the standalone `forward` passes one
+/// returning `()`.
+pub async fn forward_tcp_conn<G>(
+    endpoint: &Endpoint,
+    inbound: TcpStream,
+    remote: &RemotePath,
+    close_on_request_timeout: Duration,
+    register: impl FnOnce(&str) -> G,
+) -> Result<()> {
+    let src = inbound
+        .peer_addr()
+        .map(|addr| addr.to_string())
+        .unwrap_or_else(|_| "<unknown>".to_string());
+    info!(
+        target: "iroh_proxy::forward",
+        src = %src,
+        remote = %remote.endpoint_id,
+        service = %remote.service,
+        "forwarding connection"
+    );
+    let conn = connect_remote(endpoint, remote).await?;
+    let _guard = register(&src);
+    let (send, recv) = conn.open_bi().await?;
+    info!(
+        target: "iroh_proxy::forward",
+        src = %src,
+        remote = %remote.endpoint_id,
+        service = %remote.service,
+        "forward stream established"
+    );
+
+    let (inbound_read, inbound_write) = inbound.into_split();
+    let result = pump_streams(
+        inbound_read,
+        inbound_write,
+        send,
+        recv,
+        Some(close_on_request_timeout),
+    )
+    .await;
+
+    // Guarantee teardown of the iroh connection on every exit path (in
+    // particular the timeout/error paths).
+    conn.close(0u32.into(), b"closed");
+
+    let stats = result?;
+    if stats.timed_out {
+        warn!(
+            target: "iroh_proxy::forward",
+            src = %src,
+            remote = %remote.endpoint_id,
+            service = %remote.service,
+            timeout_secs = close_on_request_timeout.as_secs_f64(),
+            "forward close-on-request timeout reached; connection closed"
+        );
+    } else {
+        info!(
+            target: "iroh_proxy::forward",
+            src = %src,
+            remote = %remote.endpoint_id,
+            service = %remote.service,
+            up_bytes = stats.up_bytes,
+            down_bytes = stats.down_bytes,
+            "forwarding finished"
+        );
+    }
+    Ok(())
 }
 
 /// Result of a [`pump_streams`] run.

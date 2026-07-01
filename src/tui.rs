@@ -817,7 +817,7 @@ fn handle_non_modal_key(app: &mut App, key: KeyEvent, layout_mode: LayoutMode) -
 }
 
 async fn start_backend(config_path: &Path, key_file: Option<&Path>) -> Result<bool> {
-    if control::status().await?.is_some() {
+    if control::connect_running().await?.is_some() {
         return Ok(false);
     }
 
@@ -839,7 +839,7 @@ async fn start_backend(config_path: &Path, key_file: Option<&Path>) -> Result<bo
 
     for _ in 0..30 {
         time::sleep(Duration::from_millis(200)).await;
-        if control::status().await?.is_some() {
+        if control::connect_running().await?.is_some() {
             return Ok(true);
         }
         if let Some(status) = child

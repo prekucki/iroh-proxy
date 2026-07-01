@@ -272,7 +272,14 @@ impl ControlClient {
     }
 }
 
-pub async fn status() -> Result<Option<Status>> {
+/// Connect to the control plane and confirm a daemon is answering.
+///
+/// `Ok(None)` covers the common "server not running" cases (transport connect
+/// failure, Status call failure) — those are logged at debug so a broken-but-
+/// present daemon stays diagnosable with `RUST_LOG=debug`. The returned client
+/// should be reused for every RPC of the current command instead of opening a
+/// fresh connection per call.
+pub async fn connect_running() -> Result<Option<(ControlClient, Status)>> {
     let client = match ControlClient::connect().await {
         Ok(client) => client,
         Err(err) => {
@@ -280,37 +287,8 @@ pub async fn status() -> Result<Option<Status>> {
             return Ok(None);
         }
     };
-    client.status().await
-}
-
-pub async fn add_forward(
-    listen: &str,
-    remote: &str,
-    persisted: bool,
-    close_on_request_timeout_secs: u64,
-) -> Result<()> {
-    let client = ControlClient::connect().await?;
-    client
-        .add_forward(listen, remote, persisted, close_on_request_timeout_secs)
-        .await
-}
-
-pub async fn list_connections() -> Result<Vec<ActiveConnection>> {
-    let client = ControlClient::connect().await?;
-    client.list_connections().await
-}
-
-pub async fn add_serve(name: &str, target: &str) -> Result<()> {
-    let client = ControlClient::connect().await?;
-    client.add_serve(name, target).await
-}
-
-pub async fn del_serve(name: &str) -> Result<()> {
-    let client = ControlClient::connect().await?;
-    client.del_serve(name).await
-}
-
-pub async fn del_forward(listen: &str) -> Result<()> {
-    let client = ControlClient::connect().await?;
-    client.del_forward(listen).await
+    match client.status().await? {
+        Some(status) => Ok(Some((client, status))),
+        None => Ok(None),
+    }
 }

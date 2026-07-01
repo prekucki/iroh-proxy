@@ -28,10 +28,7 @@ use config::{
     add_persistent_forward_rule, add_persistent_serve_rule, default_config_path, load_config,
     load_config_or_default, remove_persistent_forward_rule_by_listen,
 };
-use control::{
-    add_forward as ctl_add_forward, add_serve as ctl_add_serve, del_forward as ctl_del_forward,
-    del_serve as ctl_del_serve,
-};
+use control::ControlClient;
 use daemon::run_server;
 use forward::{ForwardBinding, forward_bindings, forward_stdio};
 use keys::{load_or_create_forward_key, load_or_create_serve_key_and_lock};
@@ -49,7 +46,12 @@ fn init_tracing() {
         .try_init();
 }
 
-async fn ensure_server_running(key_file: Option<&Path>, config_file: &Path) -> Result<()> {
+/// Make sure a daemon is running and return a control client connected to it.
+/// The client is reused for every RPC of the invoking command.
+async fn ensure_server_running(
+    key_file: Option<&Path>,
+    config_file: &Path,
+) -> Result<ControlClient> {
     let caps = control::capabilities();
     if !caps.live_control {
         bail!(
@@ -59,8 +61,8 @@ async fn ensure_server_running(key_file: Option<&Path>, config_file: &Path) -> R
         );
     }
 
-    if control::status().await?.is_some() {
-        return Ok(());
+    if let Some((client, _)) = control::connect_running().await? {
+        return Ok(client);
     }
 
     let exe = std::env::current_exe().context("failed to resolve current executable path")?;
@@ -81,8 +83,8 @@ async fn ensure_server_running(key_file: Option<&Path>, config_file: &Path) -> R
 
     for _ in 0..30 {
         std::thread::sleep(Duration::from_millis(200));
-        if control::status().await?.is_some() {
-            return Ok(());
+        if let Some((client, _)) = control::connect_running().await? {
+            return Ok(client);
         }
         if let Some(status) = child
             .try_wait()
@@ -218,11 +220,11 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
             let use_ansi = std::io::stdout().is_terminal();
-            match control::status().await? {
-                Some(status) => {
+            match control::connect_running().await? {
+                Some((client, status)) => {
                     print_status_running(&status, use_ansi);
                     if connections {
-                        let conns = control::list_connections().await?;
+                        let conns = client.list_connections().await?;
                         print_active_connections(conns, use_ansi);
                     }
                 }
@@ -249,8 +251,9 @@ async fn main() -> Result<()> {
             listen,
             remote,
         } => {
-            ensure_server_running(cli.key_file.as_deref(), &config_path).await?;
-            ctl_add_forward(&listen, &remote, persistent, close_on_request_timeout_secs)
+            let client = ensure_server_running(cli.key_file.as_deref(), &config_path).await?;
+            client
+                .add_forward(&listen, &remote, persistent, close_on_request_timeout_secs)
                 .await
                 .with_context(|| "failed to add forward rule to running server")?;
             if persistent {
@@ -266,7 +269,7 @@ async fn main() -> Result<()> {
                         config_path.display()
                     )
                 }) {
-                    let err = match ctl_del_forward(&listen).await {
+                    let err = match client.del_forward(&listen).await {
                         Ok(()) => err.context(
                             "rolled back runtime forward after persistence failure",
                         ),
@@ -289,8 +292,9 @@ async fn main() -> Result<()> {
             name,
             target,
         } => {
-            ensure_server_running(cli.key_file.as_deref(), &config_path).await?;
-            ctl_add_serve(&name, &target)
+            let client = ensure_server_running(cli.key_file.as_deref(), &config_path).await?;
+            client
+                .add_serve(&name, &target)
                 .await
                 .with_context(|| "failed to add serve route to running server")?;
             if persistent {
@@ -302,7 +306,7 @@ async fn main() -> Result<()> {
                         )
                     })
                 {
-                    let err = match ctl_del_serve(&name).await {
+                    let err = match client.del_serve(&name).await {
                         Ok(()) => {
                             err.context("rolled back runtime serve after persistence failure")
                         }
@@ -321,14 +325,14 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Commands::DelServe { name } => {
-            ctl_del_serve(&name)
+            async { ControlClient::connect().await?.del_serve(&name).await }
                 .await
                 .with_context(|| "failed to remove serve route from running server")?;
             println!("deleted serve: {name}");
             Ok(())
         }
         Commands::DelForward { persistent, listen } => {
-            ctl_del_forward(&listen)
+            async { ControlClient::connect().await?.del_forward(&listen).await }
                 .await
                 .with_context(|| "failed to remove forward rule from running server")?;
             println!("deleted forward: {listen}");

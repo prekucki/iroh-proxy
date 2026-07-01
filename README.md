@@ -353,6 +353,7 @@ Now local clients can use `127.0.0.1:11435` as if `ollama` were local on the ser
   - macOS: sessionless `zbus` P2P over UDS (`$TMPDIR/iroh-proxy/control.sock`)
   - Windows: sessionless `zbus` P2P over UDS (`%TEMP%\\iroh-proxy\\control.sock`)
   - `status`/`tui`/`add-serve`/`add-forward`/`del-*` use the same control interface across these transports
+  - On macOS the control socket is hardened: its directory is created `0700`, the socket file is `0600`, and connections from a different uid than the daemon's are rejected. On Windows the per-user `%TEMP%` directory is the boundary (no peer credentials are available over `uds_windows`).
 
 ## Development
 

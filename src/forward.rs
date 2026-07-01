@@ -2,10 +2,10 @@ use anyhow::{Context, Result, bail};
 use iroh::SecretKey;
 use std::time::Duration;
 use tokio::io;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 use tracing::{info, warn};
 
-use crate::proxy::{build_endpoint, connect_remote, pump_streams};
+use crate::proxy::{build_endpoint, connect_remote, forward_tcp_conn, pump_streams};
 use crate::remote_path::RemotePath;
 
 #[derive(Debug, Clone)]
@@ -79,65 +79,17 @@ async fn run_forward_listener(
         let close_on_request_timeout = binding.close_on_request_timeout;
 
         tokio::spawn(async move {
-            if let Err(err) =
-                handle_forward_conn(endpoint, inbound, remote, close_on_request_timeout).await
+            if let Err(err) = forward_tcp_conn(
+                &endpoint,
+                inbound,
+                &remote,
+                close_on_request_timeout,
+                |_| (),
+            )
+            .await
             {
                 warn!(peer = %peer_addr, error = %format!("{err:#}"), "forwarding connection failed");
             }
         });
     }
-}
-
-async fn handle_forward_conn(
-    endpoint: iroh::Endpoint,
-    inbound: TcpStream,
-    remote: RemotePath,
-    close_on_request_timeout: Duration,
-) -> Result<()> {
-    let src = inbound
-        .peer_addr()
-        .map(|addr| addr.to_string())
-        .unwrap_or_else(|_| "<unknown>".to_string());
-
-    let conn = connect_remote(&endpoint, &remote).await?;
-    let (send, recv) = conn.open_bi().await?;
-    info!(
-        src = %src,
-        remote = %remote.endpoint_id,
-        service = %remote.service,
-        "forward stream established"
-    );
-
-    let (inbound_read, inbound_write) = inbound.into_split();
-    let result = pump_streams(
-        inbound_read,
-        inbound_write,
-        send,
-        recv,
-        Some(close_on_request_timeout),
-    )
-    .await;
-
-    // Guarantee teardown of the iroh connection on every exit path (in
-    // particular the timeout/error paths, which the old code failed to close).
-    conn.close(0u32.into(), b"closed");
-
-    let stats = result?;
-    if stats.timed_out {
-        warn!(
-            src = %src,
-            remote = %remote.endpoint_id,
-            service = %remote.service,
-            timeout_secs = close_on_request_timeout.as_secs_f64(),
-            "forward close-on-request timeout reached; connection closed"
-        );
-    } else {
-        info!(
-            src = %src,
-            up_bytes = stats.up_bytes,
-            down_bytes = stats.down_bytes,
-            "forwarding finished"
-        );
-    }
-    Ok(())
 }
