@@ -116,8 +116,8 @@ pub async fn run_server(
 
             let routes = Arc::clone(&routes_for_accept);
             let connections = connections_for_accept.clone();
-            let peer_addr = incoming.remote_address();
-            let local_ip = incoming.local_ip();
+            let peer_addr = incoming.remote_addr();
+            let local_addr = incoming.local_addr();
             tokio::spawn(async move {
                 if let Err(err) = handle_incoming(incoming, Arc::clone(&routes), connections).await
                 {
@@ -129,8 +129,8 @@ pub async fn run_server(
                             .join(",")
                     };
                     error!(
-                        peer_addr = %peer_addr,
-                        local_ip = ?local_ip,
+                        peer_addr = ?peer_addr,
+                        local_addr = ?local_addr,
                         peer = "<unavailable: handshake failed>",
                         service = "<unavailable: handshake failed>",
                         available_services = %available_services,

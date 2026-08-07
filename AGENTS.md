@@ -65,9 +65,11 @@ If behavior changes, update:
 
 When requested, prefer incremental additions in this order:
 
-1. Multi-service mapping in one `server` process.
-2. Access controls (allowlist/token) on `server`.
-3. UDP or protocol-aware modes (HTTP/WebSocket) as separate commands.
+1. Access controls (allowlist/token) on `server`.
+2. UDP or protocol-aware modes (HTTP/WebSocket) as separate commands.
 
-Already implemented: connection retry/backoff in `forward`
-(`proxy::connect_remote_with_retry`, applied to all forward modes).
+Already implemented:
+
+- Multi-service mapping in one `server` process.
+- Selective connection retry/backoff in `forward`, bounded by a total deadline
+  (`proxy::connect_remote_with_retry`, applied to all forward modes).

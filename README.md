@@ -209,11 +209,12 @@ In listen mode, close-on-request is enabled by default (2s). Override with:
 iroh-proxy forward --close-on-request-timeout-secs <seconds> <listen-host:port> <endpoint-id>/tcp/<service-name>
 ```
 
-Connecting to the remote endpoint retries transient failures with exponential
-backoff (4 attempts over ~3.5s) before giving up. This applies to every
-forward mode (stdio, listener, `--fdpass`, and daemon-managed `add-forward`
-rules) and covers connection establishment only — an established stream that
-breaks is not resumed.
+Connecting to the remote endpoint retries transient discovery failures,
+timeouts, and peer resets with exponential backoff (up to 4 attempts, bounded
+by a 30s total deadline). Permanent errors such as ALPN/TLS rejection fail
+immediately. This applies to every forward mode (stdio, listener, `--fdpass`,
+and daemon-managed `add-forward` rules) and covers connection establishment
+only — an established stream that breaks is not resumed.
 
 Examples:
 
@@ -346,7 +347,8 @@ Now local clients can use `127.0.0.1:11435` as if `ollama` were local on the ser
 `iroh-proxy` uses discovery through:
 
 - local mDNS (LAN discovery)
-- pkarr (relay + DHT)
+- pkarr over the n0 DNS service
+- the Mainline DHT (relay addresses only by default)
 
 ## Notes and limits
 

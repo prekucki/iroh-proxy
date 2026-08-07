@@ -23,8 +23,11 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use iroh::{
     Endpoint, RelayMode, SecretKey,
-    address_lookup::{DhtAddressLookup, MdnsAddressLookup},
+    address_lookup::{DnsAddressLookup, PkarrPublisher, PkarrResolver},
+    endpoint::{self, ConnectError, ConnectWithOptsError, ConnectingError, ConnectionError},
 };
+use iroh_mainline_address_lookup::DhtAddressLookup;
+use iroh_mdns_address_lookup::MdnsAddressLookup;
 use tokio::io::{self, AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
@@ -48,40 +51,38 @@ pub(crate) fn is_disconnect(err: &std::io::Error) -> bool {
 /// DHT/pkarr and mDNS so it is discoverable. When `false` (client/forward side)
 /// it neither publishes to pkarr nor advertises over mDNS.
 pub async fn build_endpoint(secret_key: SecretKey, publish: bool) -> Result<Endpoint> {
-    let dht = DhtAddressLookup::builder().n0_dns_pkarr_relay();
+    let dht = DhtAddressLookup::builder();
     let dht = if publish { dht } else { dht.no_publish() };
-    let mdns = MdnsAddressLookup::builder();
-    let mdns = if publish { mdns } else { mdns.advertise(false) };
+    let mdns = MdnsAddressLookup::builder().advertise(publish);
 
-    let endpoint = Endpoint::empty_builder(RelayMode::Default)
+    let mut builder = Endpoint::builder(endpoint::presets::Minimal)
+        .relay_mode(RelayMode::Default)
         .secret_key(secret_key)
+        .address_lookup(PkarrResolver::n0_dns())
+        .address_lookup(DnsAddressLookup::n0_dns())
         .address_lookup(dht)
-        .address_lookup(mdns)
-        .bind()
-        .await?;
+        .address_lookup(mdns);
+    if publish {
+        builder = builder.address_lookup(PkarrPublisher::n0_dns());
+    }
+
+    let endpoint = builder.bind().await?;
     endpoint.online().await;
     Ok(endpoint)
 }
 
-/// Connect to a remote service path over iroh.
-pub async fn connect_remote(
+/// Make one connection attempt to a remote service path over iroh.
+async fn connect_remote(
     endpoint: &Endpoint,
     remote: &RemotePath,
-) -> Result<iroh::endpoint::Connection> {
+) -> std::result::Result<iroh::endpoint::Connection, ConnectError> {
     let alpn = remote.to_alpn();
-    endpoint
-        .connect(remote.endpoint_id, &alpn)
-        .await
-        .with_context(|| {
-            format!(
-                "failed connecting to remote endpoint {} (discovery failed via local mDNS and pkarr)",
-                remote.endpoint_id
-            )
-        })
+    endpoint.connect(remote.endpoint_id, &alpn).await
 }
 
 /// Retry policy for establishing the remote connection: exponential backoff,
-/// no jitter (attempts are few and this is a single-user tool).
+/// a total deadline, and no jitter (attempts are few and this is a single-user
+/// tool).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetryPolicy {
     /// Total connect attempts, including the first. `1` disables retrying.
@@ -89,17 +90,20 @@ pub struct RetryPolicy {
     /// Wait before the second attempt; doubles per retry up to `max_backoff`.
     pub initial_backoff: Duration,
     pub max_backoff: Duration,
+    /// Deadline covering connection attempts and sleeps between them.
+    pub total_timeout: Duration,
 }
 
 impl Default for RetryPolicy {
-    /// 4 attempts over ~3.5s (0.5s + 1s + 2s) — long enough to ride out a
-    /// discovery blip, short enough that a waiting local client (or ssh via
-    /// ProxyCommand) sees a timely failure when the remote is really gone.
+    /// Up to 4 attempts with 0.5s + 1s + 2s backoff, bounded by a 30s total
+    /// deadline so a waiting local client (or ssh via ProxyCommand) sees a
+    /// predictable failure when the remote is really gone.
     fn default() -> Self {
         Self {
             max_attempts: 4,
             initial_backoff: Duration::from_millis(500),
             max_backoff: Duration::from_secs(5),
+            total_timeout: Duration::from_secs(30),
         }
     }
 }
@@ -108,31 +112,85 @@ fn next_backoff(current: Duration, max: Duration) -> Duration {
     current.saturating_mul(2).min(max)
 }
 
-/// Run `attempt_fn` until it succeeds or `policy.max_attempts` is exhausted,
-/// sleeping with exponential backoff between attempts.
-async fn retry_with_backoff<T, Fut>(
+fn is_transient_connection_error(err: &ConnectionError) -> bool {
+    matches!(err, ConnectionError::Reset | ConnectionError::TimedOut)
+}
+
+/// Return whether retrying the same remote connection can plausibly succeed
+/// without changing local configuration or the requested endpoint/ALPN.
+fn is_transient_connect_error(err: &ConnectError) -> bool {
+    match err {
+        // Discovery data may not have propagated yet.
+        ConnectError::Connect {
+            source: ConnectWithOptsError::NoAddress { .. },
+            ..
+        } => true,
+        ConnectError::Connecting {
+            source: ConnectingError::ConnectionError { source, .. },
+            ..
+        }
+        | ConnectError::Connection { source, .. } => is_transient_connection_error(source),
+        // Self-connect, local rejection, TLS/authentication/ALPN failures and
+        // local endpoint/configuration errors need a configuration change.
+        _ => false,
+    }
+}
+
+/// Run `attempt_fn` until it succeeds, returns a permanent error, exhausts
+/// `policy.max_attempts`, or reaches `policy.total_timeout`.
+async fn retry_with_backoff<T, E, Fut>(
     policy: RetryPolicy,
     what: &str,
     mut attempt_fn: impl FnMut() -> Fut,
+    is_retryable: impl Fn(&E) -> bool,
 ) -> Result<T>
 where
-    Fut: Future<Output = Result<T>>,
+    E: std::error::Error + Send + Sync + 'static,
+    Fut: Future<Output = std::result::Result<T, E>>,
 {
+    let started = tokio::time::Instant::now();
+    let deadline = started + policy.total_timeout;
+    let max_attempts = policy.max_attempts.max(1);
     let mut backoff = policy.initial_backoff;
     let mut attempt = 1u32;
     loop {
-        match attempt_fn().await {
+        let attempt_result = match tokio::time::timeout_at(deadline, attempt_fn()).await {
+            Ok(result) => result,
+            Err(_) => {
+                anyhow::bail!(
+                    "{what}: timed out after {:.3}s during attempt {attempt}",
+                    started.elapsed().as_secs_f64()
+                );
+            }
+        };
+
+        match attempt_result {
             Ok(value) => return Ok(value),
-            Err(err) if attempt < policy.max_attempts => {
+            Err(err) if !is_retryable(&err) => return Err(err.into()),
+            Err(err) if attempt < max_attempts => {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    anyhow::bail!(
+                        "{what}: timed out after {:.3}s following {attempt} attempts",
+                        started.elapsed().as_secs_f64()
+                    );
+                }
+                let sleep_for = backoff.min(remaining);
                 warn!(
                     attempt,
-                    max_attempts = policy.max_attempts,
-                    backoff_ms = backoff.as_millis() as u64,
-                    error = %format!("{err:#}"),
+                    max_attempts,
+                    backoff_ms = sleep_for.as_millis() as u64,
+                    error = %err,
                     "{} failed; retrying",
                     what
                 );
-                tokio::time::sleep(backoff).await;
+                tokio::time::sleep(sleep_for).await;
+                if sleep_for < backoff {
+                    anyhow::bail!(
+                        "{what}: timed out after {:.3}s following {attempt} attempts",
+                        started.elapsed().as_secs_f64()
+                    );
+                }
                 backoff = next_backoff(backoff, policy.max_backoff);
                 attempt += 1;
             }
@@ -140,7 +198,7 @@ where
                 return Err(err)
                     .with_context(|| format!("{what}: giving up after {attempt} attempts"));
             }
-            Err(err) => return Err(err),
+            Err(err) => return Err(err.into()),
         }
     }
 }
@@ -153,10 +211,19 @@ pub async fn connect_remote_with_retry(
     remote: &RemotePath,
     policy: RetryPolicy,
 ) -> Result<iroh::endpoint::Connection> {
-    retry_with_backoff(policy, "remote connect", || {
-        connect_remote(endpoint, remote)
-    })
+    retry_with_backoff(
+        policy,
+        "remote connect",
+        || connect_remote(endpoint, remote),
+        is_transient_connect_error,
+    )
     .await
+    .with_context(|| {
+        format!(
+            "failed connecting to remote endpoint {} via configured address lookups",
+            remote.endpoint_id
+        )
+    })
 }
 
 /// Forward one accepted local TCP connection to a remote service: connect
@@ -352,7 +419,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::{SeedableRng, rngs::StdRng};
     use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex, split};
     use tokio::net::{TcpListener, TcpStream};
 
@@ -449,7 +515,30 @@ mod tests {
             max_attempts,
             initial_backoff: Duration::from_millis(1),
             max_backoff: Duration::from_millis(2),
+            total_timeout: Duration::from_secs(1),
         }
+    }
+
+    #[derive(Debug)]
+    struct TestAttemptError {
+        message: &'static str,
+        retryable: bool,
+    }
+
+    impl std::fmt::Display for TestAttemptError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.message)
+        }
+    }
+
+    impl std::error::Error for TestAttemptError {}
+
+    fn test_error(message: &'static str, retryable: bool) -> TestAttemptError {
+        TestAttemptError { message, retryable }
+    }
+
+    fn test_error_is_retryable(err: &TestAttemptError) -> bool {
+        err.retryable
     }
 
     #[test]
@@ -476,10 +565,15 @@ mod tests {
     #[tokio::test]
     async fn retry_succeeds_without_retrying_when_first_attempt_is_ok() {
         let calls = std::cell::Cell::new(0u32);
-        let result = retry_with_backoff(tiny_retry_policy(4), "test op", || {
-            calls.set(calls.get() + 1);
-            async { Ok::<_, anyhow::Error>(42) }
-        })
+        let result = retry_with_backoff(
+            tiny_retry_policy(4),
+            "test op",
+            || {
+                calls.set(calls.get() + 1);
+                async { Ok::<_, TestAttemptError>(42) }
+            },
+            test_error_is_retryable,
+        )
         .await
         .unwrap();
         assert_eq!(result, 42);
@@ -489,17 +583,22 @@ mod tests {
     #[tokio::test]
     async fn retry_recovers_from_transient_failures() {
         let calls = std::cell::Cell::new(0u32);
-        let result = retry_with_backoff(tiny_retry_policy(4), "test op", || {
-            calls.set(calls.get() + 1);
-            let n = calls.get();
-            async move {
-                if n < 3 {
-                    Err(anyhow::anyhow!("transient failure {n}"))
-                } else {
-                    Ok(n)
+        let result = retry_with_backoff(
+            tiny_retry_policy(4),
+            "test op",
+            || {
+                calls.set(calls.get() + 1);
+                let n = calls.get();
+                async move {
+                    if n < 3 {
+                        Err(test_error("transient failure", true))
+                    } else {
+                        Ok(n)
+                    }
                 }
-            }
-        })
+            },
+            test_error_is_retryable,
+        )
         .await
         .unwrap();
         assert_eq!(result, 3, "must succeed on the third attempt");
@@ -509,10 +608,15 @@ mod tests {
     #[tokio::test]
     async fn retry_gives_up_after_max_attempts() {
         let calls = std::cell::Cell::new(0u32);
-        let err = retry_with_backoff(tiny_retry_policy(3), "test op", || {
-            calls.set(calls.get() + 1);
-            async { Err::<(), _>(anyhow::anyhow!("permanent failure")) }
-        })
+        let err = retry_with_backoff(
+            tiny_retry_policy(3),
+            "test op",
+            || {
+                calls.set(calls.get() + 1);
+                async { Err::<(), _>(test_error("transient failure", true)) }
+            },
+            test_error_is_retryable,
+        )
         .await
         .unwrap_err();
         assert_eq!(calls.get(), 3, "must stop at max_attempts");
@@ -523,12 +627,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retry_returns_permanent_failure_without_retrying() {
+        let calls = std::cell::Cell::new(0u32);
+        let err = retry_with_backoff(
+            tiny_retry_policy(4),
+            "test op",
+            || {
+                calls.set(calls.get() + 1);
+                async { Err::<(), _>(test_error("permanent failure", false)) }
+            },
+            test_error_is_retryable,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(calls.get(), 1, "permanent errors must not be retried");
+        assert_eq!(err.to_string(), "permanent failure");
+    }
+
+    #[tokio::test]
     async fn retry_disabled_with_single_attempt_returns_plain_error() {
         let calls = std::cell::Cell::new(0u32);
-        let err = retry_with_backoff(tiny_retry_policy(1), "test op", || {
-            calls.set(calls.get() + 1);
-            async { Err::<(), _>(anyhow::anyhow!("root cause")) }
-        })
+        let err = retry_with_backoff(
+            tiny_retry_policy(1),
+            "test op",
+            || {
+                calls.set(calls.get() + 1);
+                async { Err::<(), _>(test_error("root cause", true)) }
+            },
+            test_error_is_retryable,
+        )
         .await
         .unwrap_err();
         assert_eq!(calls.get(), 1);
@@ -536,6 +663,47 @@ mod tests {
             !format!("{err:#}").contains("giving up"),
             "single-attempt failure must not claim retries happened: {err:#}"
         );
+    }
+
+    #[tokio::test]
+    async fn retry_total_timeout_bounds_an_in_progress_attempt() {
+        let mut policy = tiny_retry_policy(4);
+        policy.total_timeout = Duration::from_millis(20);
+        let calls = std::cell::Cell::new(0u32);
+        let err = retry_with_backoff(
+            policy,
+            "test op",
+            || {
+                calls.set(calls.get() + 1);
+                async {
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    Ok::<_, TestAttemptError>(())
+                }
+            },
+            test_error_is_retryable,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(calls.get(), 1);
+        assert!(
+            err.to_string().contains("timed out") && err.to_string().contains("attempt 1"),
+            "deadline error must identify the interrupted attempt: {err:#}"
+        );
+    }
+
+    #[test]
+    fn quic_retry_classification_is_conservative() {
+        assert!(is_transient_connection_error(&ConnectionError::TimedOut));
+        assert!(is_transient_connection_error(&ConnectionError::Reset));
+        assert!(!is_transient_connection_error(
+            &ConnectionError::VersionMismatch
+        ));
+        assert!(!is_transient_connection_error(
+            &ConnectionError::LocallyClosed
+        ));
+        assert!(!is_transient_connection_error(
+            &ConnectionError::CidsExhausted
+        ));
     }
 
     #[test]
@@ -579,8 +747,9 @@ mod tests {
         let alpn = b"iroh-proxy/tcp/echo".to_vec();
 
         // Server endpoint: serve path via pump_streams(None) into the echo.
-        let server = Endpoint::empty_builder(RelayMode::Disabled)
-            .secret_key(SecretKey::generate(&mut StdRng::from_os_rng()))
+        let server = Endpoint::builder(endpoint::presets::Minimal)
+            .relay_mode(RelayMode::Disabled)
+            .secret_key(SecretKey::generate())
             .bind()
             .await?;
         server.set_alpns(vec![alpn.clone()]);
@@ -615,8 +784,9 @@ mod tests {
         // The whole exchange is bounded so a discovery/connectivity failure
         // fails the test instead of hanging the suite.
         let exchange = async {
-            let client = Endpoint::empty_builder(RelayMode::Disabled)
-                .secret_key(SecretKey::generate(&mut StdRng::from_os_rng()))
+            let client = Endpoint::builder(endpoint::presets::Minimal)
+                .relay_mode(RelayMode::Disabled)
+                .secret_key(SecretKey::generate())
                 .bind()
                 .await?;
             let conn = client.connect(server_addr, &alpn).await?;
@@ -647,6 +817,7 @@ mod tests {
             assert!(!client_stats.timed_out);
             assert_eq!(client_stats.up_bytes, payload.len() as u64);
             assert_eq!(client_stats.down_bytes, payload.len() as u64);
+            client.close().await;
             Ok::<(), anyhow::Error>(())
         };
 

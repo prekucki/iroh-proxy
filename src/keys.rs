@@ -7,8 +7,6 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow};
 use directories::ProjectDirs;
 use iroh::SecretKey;
-use rand::SeedableRng;
-use rand::rngs::StdRng;
 
 pub struct ServeKeyLock {
     file: File,
@@ -42,7 +40,7 @@ pub fn load_or_create_secret_key(path: &Path) -> Result<SecretKey> {
         }
     }
 
-    let sk = SecretKey::generate(&mut StdRng::from_os_rng());
+    let sk = SecretKey::generate();
     let mut file = match open_secret_key_for_create(path) {
         Ok(file) => file,
         Err(err) if err.kind() == ErrorKind::AlreadyExists => {
@@ -97,7 +95,7 @@ fn load_or_create_secret_key_from_file(file: &mut File, path: &Path) -> Result<S
         .with_context(|| format!("failed to read key file {}", path.display()))?;
 
     if raw.is_empty() {
-        let sk = SecretKey::generate(&mut StdRng::from_os_rng());
+        let sk = SecretKey::generate();
         restrict_secret_key_permissions(path)?;
         file.set_len(0)
             .with_context(|| format!("failed to truncate key file {}", path.display()))?;
@@ -161,7 +159,7 @@ pub fn load_or_create_forward_key(key_file: Option<&Path>) -> Result<SecretKey> 
     if let Some(path) = key_file {
         return load_or_create_secret_key(path);
     }
-    Ok(SecretKey::generate(&mut StdRng::from_os_rng()))
+    Ok(SecretKey::generate())
 }
 
 #[cfg(test)]
