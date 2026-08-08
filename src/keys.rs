@@ -162,12 +162,11 @@ pub fn load_or_create_forward_key(key_file: Option<&Path>) -> Result<SecretKey> 
     Ok(SecretKey::generate())
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    #[cfg(unix)]
     fn temp_key_path(name: &str) -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -181,7 +180,6 @@ mod tests {
         dir.join("secret_key")
     }
 
-    #[cfg(unix)]
     #[test]
     fn load_or_create_secret_key_creates_private_file() {
         let path = temp_key_path("create-private");
@@ -196,7 +194,6 @@ mod tests {
         assert_eq!(mode, 0o600);
     }
 
-    #[cfg(unix)]
     #[test]
     fn load_or_create_secret_key_tightens_existing_file() {
         let path = temp_key_path("tighten-existing");
