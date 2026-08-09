@@ -60,6 +60,57 @@ systemctl --user daemon-reload
 systemctl --user enable --now iroh-proxy.service
 ```
 
+### Diagnostics
+
+Logs are written to stderr (and therefore to the journal under systemd). Stdout
+is kept exclusively for command output and the `forward` stdio transport.
+
+Follow server logs:
+
+```bash
+journalctl --user -u iroh-proxy.service -f -o cat
+```
+
+For a focused diagnostic run in the foreground:
+
+```bash
+RUST_LOG='warn,iroh_proxy=debug,iroh::_events=debug,iroh::socket::transports::relay::actor=debug,noq_proto::connection::paths=debug' \
+  iroh-proxy server
+```
+
+For an installed user service, create a persistent override with
+`systemctl --user edit iroh-proxy.service`:
+
+```ini
+[Service]
+Environment="RUST_LOG=warn,iroh_proxy=debug,iroh::_events=debug,iroh::socket::transports::relay::actor=debug,noq_proto::connection::paths=debug"
+```
+
+Then apply it:
+
+```bash
+systemctl --user daemon-reload
+systemctl --user restart iroh-proxy.service
+```
+
+Incoming connection logs identify the lifecycle `stage` (`handshake`, `route`,
+`accept_stream`, `connect_target`, `proxy_stream`, or `closed`) and, after a
+successful handshake, include the authenticated peer, process-local
+`connection_id`, connection age, selected relay/direct path, RTT, QUIC close
+reason, and packet loss counters when they are available. Connection logs can
+expose endpoint IDs, service names, targets, addresses, and network topology,
+but never private key material.
+
+With the currently pinned iroh 1.0.3 transport defaults, keep-alives run every
+5 seconds, the connection idle timeout is 30 seconds, and direct/relay paths
+use 15/30-second idle limits. The separate
+`--close-on-request-timeout-secs` timer starts only after the local TCP request
+side reaches EOF; it does not expire an active SSH stream.
+
+A daemon implicitly started by an `add-*` command detaches with its standard
+streams redirected to `/dev/null`. Install the user service or run `server` in
+the foreground when persistent diagnostics are required.
+
 ### `status`
 
 Check whether the live proxy server is running and show current counts.

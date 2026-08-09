@@ -35,8 +35,8 @@ use tracing::{debug, info, warn};
 
 use crate::remote_path::RemotePath;
 
-/// Classifies a copy error as a benign, peer-initiated disconnect (logged at
-/// `debug`) rather than a genuine failure (logged at `warn`).
+/// Classifies I/O errors that normally represent an expected stream disconnect
+/// so the connection boundary can choose an appropriate log level.
 pub(crate) fn is_disconnect(err: &std::io::Error) -> bool {
     use std::io::ErrorKind::*;
     matches!(
@@ -354,14 +354,7 @@ where
         let mut local_write = local_write;
         let n = match io::copy(&mut remote_recv, &mut local_write).await {
             Ok(n) => n,
-            Err(err) => {
-                if is_disconnect(&err) {
-                    debug!(error = %err, "iroh->local disconnected");
-                } else {
-                    warn!(error = %err, "iroh->local copy failed");
-                }
-                return Err(err.into());
-            }
+            Err(err) => return Err(err).context("iroh->local copy failed"),
         };
         let _ = local_write.shutdown().await;
         Ok(n)
@@ -371,14 +364,7 @@ where
     let up_result: Result<u64> = async {
         let n = match io::copy(&mut local_read, &mut remote_send).await {
             Ok(n) => n,
-            Err(err) => {
-                if is_disconnect(&err) {
-                    debug!(error = %err, "local->iroh disconnected");
-                } else {
-                    warn!(error = %err, "local->iroh copy failed");
-                }
-                return Err(err.into());
-            }
+            Err(err) => return Err(err).context("local->iroh copy failed"),
         };
         if let Err(err) = remote_send.shutdown().await {
             debug!(error = %err, "failed to half-close iroh send stream");
@@ -508,6 +494,31 @@ mod tests {
             .unwrap();
         assert!(stats.timed_out, "expected the timeout branch to fire");
         assert_eq!(stats.up_bytes, 3);
+    }
+
+    #[tokio::test]
+    async fn pump_error_identifies_the_failed_direction() {
+        let (mut app_to_proxy, local_read) = pipe();
+        let (remote_send, upstream_in) = pipe();
+        drop(upstream_in);
+        let (_upstream_out_held, remote_recv) = pipe();
+        let (local_write, _proxy_to_app_held) = pipe();
+
+        let pump = tokio::spawn(pump_streams(
+            local_read,
+            local_write,
+            remote_send,
+            remote_recv,
+            None,
+        ));
+        app_to_proxy.write_all(b"request").await.unwrap();
+        app_to_proxy.shutdown().await.unwrap();
+
+        let err = pump.await.unwrap().unwrap_err();
+        assert!(
+            format!("{err:#}").contains("local->iroh copy failed"),
+            "error chain must identify the failed direction: {err:#}"
+        );
     }
 
     fn tiny_retry_policy(max_attempts: u32) -> RetryPolicy {

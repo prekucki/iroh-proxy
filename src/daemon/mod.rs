@@ -10,6 +10,7 @@
 
 mod connections;
 mod control_plane;
+mod diagnostics;
 mod forwards;
 mod routes;
 mod service;
@@ -116,28 +117,8 @@ pub async fn run_server(
 
             let routes = Arc::clone(&routes_for_accept);
             let connections = connections_for_accept.clone();
-            let peer_addr = incoming.remote_addr();
-            let local_addr = incoming.local_addr();
             tokio::spawn(async move {
-                if let Err(err) = handle_incoming(incoming, Arc::clone(&routes), connections).await
-                {
-                    let available_services = {
-                        let map = routes.read().await;
-                        map.values()
-                            .map(|route| route.name.as_ref())
-                            .collect::<Vec<_>>()
-                            .join(",")
-                    };
-                    error!(
-                        peer_addr = ?peer_addr,
-                        local_addr = ?local_addr,
-                        peer = "<unavailable: handshake failed>",
-                        service = "<unavailable: handshake failed>",
-                        available_services = %available_services,
-                        error = %err,
-                        "incoming connection error"
-                    );
-                }
+                handle_incoming(incoming, Arc::clone(&routes), connections).await;
             });
         }
     });
