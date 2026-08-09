@@ -53,6 +53,7 @@ fn init_tracing() {
 async fn ensure_server_running(
     key_file: Option<&Path>,
     config_file: &Path,
+    mdns_enabled: bool,
 ) -> Result<ControlClient> {
     let caps = control::capabilities();
     if !caps.live_control {
@@ -71,6 +72,9 @@ async fn ensure_server_running(
     let mut command = std::process::Command::new(exe);
     if let Some(path) = key_file {
         command.arg("--key-file").arg(path);
+    }
+    if !mdns_enabled {
+        command.arg("--no-mdns");
     }
     command.arg("--config-file").arg(config_file);
     command
@@ -177,6 +181,7 @@ async fn main() -> Result<()> {
     init_tracing();
     let cli = Cli::parse();
     let config_path = cli.config_file.clone().unwrap_or_else(default_config_path);
+    let mdns_enabled = !cli.no_mdns;
 
     match cli.command {
         Commands::Server { install } => {
@@ -189,8 +194,12 @@ async fn main() -> Result<()> {
                 {
                     let exe = std::env::current_exe()
                         .context("failed to resolve current executable path for service install")?;
-                    let service_path =
-                        systemd::install_user_service(&exe, cli.key_file.as_deref(), &config_path)?;
+                    let service_path = systemd::install_user_service(
+                        &exe,
+                        cli.key_file.as_deref(),
+                        &config_path,
+                        mdns_enabled,
+                    )?;
                     println!("installed: {}", service_path.display());
                     println!("next:");
                     println!("  systemctl --user daemon-reload");
@@ -209,7 +218,7 @@ async fn main() -> Result<()> {
                 .forward
                 .map(|section| section.services)
                 .unwrap_or_default();
-            run_server(secret_key, initial_services, initial_forwards).await
+            run_server(secret_key, initial_services, initial_forwards, mdns_enabled).await
         }
         Commands::Status { connections } => {
             let caps = control::capabilities();
@@ -245,7 +254,7 @@ async fn main() -> Result<()> {
                     caps.transport_label
                 );
             }
-            tui::run_tui(&config_path, cli.key_file.as_deref()).await
+            tui::run_tui(&config_path, cli.key_file.as_deref(), mdns_enabled).await
         }
         Commands::AddForward {
             persistent,
@@ -253,7 +262,8 @@ async fn main() -> Result<()> {
             listen,
             remote,
         } => {
-            let client = ensure_server_running(cli.key_file.as_deref(), &config_path).await?;
+            let client =
+                ensure_server_running(cli.key_file.as_deref(), &config_path, mdns_enabled).await?;
             client
                 .add_forward(&listen, &remote, persistent, close_on_request_timeout_secs)
                 .await
@@ -294,7 +304,8 @@ async fn main() -> Result<()> {
             name,
             target,
         } => {
-            let client = ensure_server_running(cli.key_file.as_deref(), &config_path).await?;
+            let client =
+                ensure_server_running(cli.key_file.as_deref(), &config_path, mdns_enabled).await?;
             client
                 .add_serve(&name, &target)
                 .await
@@ -374,7 +385,7 @@ async fn main() -> Result<()> {
                 }
                 let secret_key = load_or_create_forward_key(cli.key_file.as_deref())?;
                 let remote = RemotePath::from_str(&first)?;
-                return fdpass::run_fdpass_child(secret_key, remote, fd).await;
+                return fdpass::run_fdpass_child(secret_key, remote, fd, mdns_enabled).await;
             }
             #[cfg(not(unix))]
             if fdpass_fd.is_some() {
@@ -389,7 +400,7 @@ async fn main() -> Result<()> {
                     }
                     // Validate remote before forking the relay child.
                     RemotePath::from_str(&first)?;
-                    return fdpass::run_fdpass_parent(&first, cli.key_file.as_ref());
+                    return fdpass::run_fdpass_parent(&first, cli.key_file.as_ref(), mdns_enabled);
                 }
                 #[cfg(not(unix))]
                 {
@@ -407,12 +418,12 @@ async fn main() -> Result<()> {
                             close_on_request_timeout_secs,
                         ),
                     }];
-                    forward_bindings(secret_key, bindings).await
+                    forward_bindings(secret_key, bindings, mdns_enabled).await
                 }
                 None => {
                     let secret_key = load_or_create_forward_key(cli.key_file.as_deref())?;
                     let remote = RemotePath::from_str(&first)?;
-                    forward_stdio(secret_key, remote).await
+                    forward_stdio(secret_key, remote, mdns_enabled).await
                 }
             }
         }
@@ -435,7 +446,7 @@ async fn main() -> Result<()> {
                 });
             }
 
-            forward_bindings(secret_key, bindings).await
+            forward_bindings(secret_key, bindings, mdns_enabled).await
         }
         Commands::Version { short } => {
             if short {

@@ -607,7 +607,11 @@ async fn fetch_snapshot(control_client: &mut Option<control::ControlClient>) -> 
     })
 }
 
-pub async fn run_tui(config_path: &Path, key_file: Option<&Path>) -> Result<()> {
+pub async fn run_tui(
+    config_path: &Path,
+    key_file: Option<&Path>,
+    mdns_enabled: bool,
+) -> Result<()> {
     enable_raw_mode().context("failed to enable raw mode")?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen).context("failed to enter alternate screen")?;
@@ -615,7 +619,7 @@ pub async fn run_tui(config_path: &Path, key_file: Option<&Path>) -> Result<()> 
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).context("failed to create terminal")?;
 
-    let result = run_tui_loop(&mut terminal, config_path, key_file).await;
+    let result = run_tui_loop(&mut terminal, config_path, key_file, mdns_enabled).await;
 
     disable_raw_mode().context("failed to disable raw mode")?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)
@@ -629,6 +633,7 @@ async fn run_tui_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     config_path: &Path,
     key_file: Option<&Path>,
+    mdns_enabled: bool,
 ) -> Result<()> {
     let mut app = App {
         icon_mode: resolve_icon_mode(),
@@ -660,6 +665,7 @@ async fn run_tui_loop(
                     key,
                     config_path,
                     key_file,
+                    mdns_enabled,
                     layout_mode,
                     &mut control_client,
                 )
@@ -682,6 +688,7 @@ async fn handle_key(
     key: KeyEvent,
     config_path: &Path,
     key_file: Option<&Path>,
+    mdns_enabled: bool,
     layout_mode: LayoutMode,
     control_client: &mut Option<control::ControlClient>,
 ) -> Result<bool> {
@@ -710,7 +717,7 @@ async fn handle_key(
     match handle_non_modal_key(app, key, layout_mode) {
         KeyAction::Quit => return Ok(true),
         KeyAction::Refresh => refresh(app, control_client).await?,
-        KeyAction::StartBackend => match start_backend(config_path, key_file).await {
+        KeyAction::StartBackend => match start_backend(config_path, key_file, mdns_enabled).await {
             Ok(true) => {
                 refresh(app, control_client).await?;
                 app.set_info("Started backend server");
@@ -816,7 +823,11 @@ fn handle_non_modal_key(app: &mut App, key: KeyEvent, layout_mode: LayoutMode) -
     }
 }
 
-async fn start_backend(config_path: &Path, key_file: Option<&Path>) -> Result<bool> {
+async fn start_backend(
+    config_path: &Path,
+    key_file: Option<&Path>,
+    mdns_enabled: bool,
+) -> Result<bool> {
     if control::connect_running().await?.is_some() {
         return Ok(false);
     }
@@ -825,6 +836,9 @@ async fn start_backend(config_path: &Path, key_file: Option<&Path>) -> Result<bo
     let mut command = std::process::Command::new(exe);
     if let Some(path) = key_file {
         command.arg("--key-file").arg(path);
+    }
+    if !mdns_enabled {
+        command.arg("--no-mdns");
     }
     command.arg("--config-file").arg(config_path);
     command

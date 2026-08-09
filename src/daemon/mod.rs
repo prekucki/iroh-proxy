@@ -43,8 +43,9 @@ pub async fn run_server(
     secret_key: SecretKey,
     initial_services: Vec<ServeService>,
     initial_forwards: Vec<ForwardService>,
+    mdns_enabled: bool,
 ) -> Result<()> {
-    let endpoint = build_endpoint(secret_key, true).await?;
+    let endpoint = build_endpoint(secret_key, true, mdns_enabled).await?;
 
     let routes: Routes = Arc::new(RwLock::new(HashMap::new()));
     let forwards: Forwards = Arc::new(Mutex::new(HashMap::new()));
@@ -90,7 +91,7 @@ pub async fn run_server(
 
     let _control_plane = control_plane::start(svc, state_rx).await?;
 
-    info!(endpoint_id = %endpoint.id(), "proxy server started");
+    info!(endpoint_id = %endpoint.id(), mdns_enabled, "proxy server started");
     {
         let snapshot = routes.read().await;
         for (alpn, route) in snapshot.iter() {
