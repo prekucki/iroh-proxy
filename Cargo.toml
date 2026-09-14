@@ -38,6 +38,16 @@ libc = "0.2"
 uds_windows = "1"
 zbus = { version = "5", features = ["p2p"] }
 
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
+
+# Pin the recovery fork and its workspace crates to the same source revision.
+[patch.crates-io]
+iroh = { git = "https://github.com/prekucki/iroh", rev = "b61fa39a76e0f22d2db21c9eb2f77e6df7a8de0d" }
+iroh-base = { git = "https://github.com/prekucki/iroh", rev = "b61fa39a76e0f22d2db21c9eb2f77e6df7a8de0d" }
+iroh-dns = { git = "https://github.com/prekucki/iroh", rev = "b61fa39a76e0f22d2db21c9eb2f77e6df7a8de0d" }
+iroh-relay = { git = "https://github.com/prekucki/iroh", rev = "b61fa39a76e0f22d2db21c9eb2f77e6df7a8de0d" }
+
 # The profile that 'dist' will build with
 [profile.dist]
 inherits = "release"

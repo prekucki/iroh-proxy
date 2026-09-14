@@ -41,6 +41,19 @@ removes its control socket on exit (macOS/Windows). If the underlying iroh
 endpoint closes, the process exits with a non-zero status so a supervisor
 (systemd, launchd) can restart it instead of leaving a live-but-dead process.
 
+Server and forward commands wait at most 20 seconds for relay readiness after
+binding the endpoint. If that wait expires, they log a warning and continue in
+a degraded state: direct connections remain available and iroh keeps trying to
+connect to a relay in the background. This limit is separate from the remote
+connection retry deadline.
+
+The pinned iroh fork bounds relay close handshakes and internal control
+requests. Unresponsive relay actors are retired; the home relay actor is
+recreated in the same process after the previous task finishes. Server identity
+and service mappings remain unchanged. Established TCP streams are not replayed
+or resumed; clients must reconnect if their connection fails. See
+[the dependency patch notes](docs/relay-recovery.md) for scope and verification.
+
 Install a user systemd unit:
 
 ```bash
