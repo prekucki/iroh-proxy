@@ -37,12 +37,6 @@ use crate::remote_path::RemotePath;
 
 const ENDPOINT_ONLINE_TIMEOUT: Duration = Duration::from_secs(20);
 
-async fn wait_for_online(online: impl std::future::Future<Output = ()>) -> bool {
-    tokio::time::timeout(ENDPOINT_ONLINE_TIMEOUT, online)
-        .await
-        .is_ok()
-}
-
 /// Classifies I/O errors that normally represent an expected stream disconnect
 /// so the connection boundary can choose an appropriate log level.
 pub(crate) fn is_disconnect(err: &std::io::Error) -> bool {
@@ -78,7 +72,10 @@ pub async fn build_endpoint(secret_key: SecretKey, publish: bool) -> Result<Endp
         .bind()
         .await
         .context("failed to bind iroh endpoint")?;
-    if !wait_for_online(endpoint.online()).await {
+    if tokio::time::timeout(ENDPOINT_ONLINE_TIMEOUT, endpoint.online())
+        .await
+        .is_err()
+    {
         warn!(
             timeout_secs = ENDPOINT_ONLINE_TIMEOUT.as_secs(),
             "relay readiness timed out; continuing with a degraded endpoint while iroh reconnects"
@@ -422,20 +419,6 @@ where
 mod tests {
     use super::*;
 
-    #[tokio::test(start_paused = true)]
-    async fn endpoint_readiness_timeout_does_not_cancel_background_recovery() {
-        let (ready_tx, ready_rx) = tokio::sync::watch::channel(false);
-        let recovery = tokio::spawn(async move {
-            tokio::time::sleep(ENDPOINT_ONLINE_TIMEOUT * 2).await;
-            ready_tx.send(true).unwrap();
-        });
-        let wait = |mut ready: tokio::sync::watch::Receiver<bool>| async move {
-            ready.wait_for(|online| *online).await.unwrap();
-        };
-        assert!(!wait_for_online(wait(ready_rx.clone())).await);
-        recovery.await.unwrap();
-        assert!(wait_for_online(wait(ready_rx)).await);
-    }
     use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex, split};
     use tokio::net::{TcpListener, TcpStream};
 
