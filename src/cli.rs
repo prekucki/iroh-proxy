@@ -16,6 +16,10 @@ pub struct Cli {
     /// Path to proxy config file (defaults to ~/.config/iroh-proxy/config.toml)
     #[arg(long)]
     pub config_file: Option<PathBuf>,
+
+    /// Disable local mDNS discovery and mDNS advertising on servers
+    #[arg(long, global = true)]
+    pub no_mdns: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -122,4 +126,24 @@ pub enum Commands {
         #[arg(long)]
         short: bool,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_mdns_is_accepted_before_or_after_subcommand() {
+        let default =
+            Cli::try_parse_from(["iroh-proxy", "server"]).expect("server command should parse");
+        assert!(!default.no_mdns);
+
+        let before = Cli::try_parse_from(["iroh-proxy", "--no-mdns", "server"])
+            .expect("global flag before subcommand should parse");
+        assert!(before.no_mdns);
+
+        let after = Cli::try_parse_from(["iroh-proxy", "server", "--no-mdns"])
+            .expect("global flag after subcommand should parse");
+        assert!(after.no_mdns);
+    }
 }
