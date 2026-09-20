@@ -17,8 +17,12 @@ pub struct ForwardBinding {
     pub close_on_request_timeout: Duration,
 }
 
-pub async fn forward_stdio(secret_key: SecretKey, remote: RemotePath) -> Result<()> {
-    let endpoint = build_endpoint(secret_key, false).await?;
+pub async fn forward_stdio(
+    secret_key: SecretKey,
+    remote: RemotePath,
+    mdns_enabled: bool,
+) -> Result<()> {
+    let endpoint = build_endpoint(secret_key, false, mdns_enabled).await?;
     let conn = connect_remote_with_retry(&endpoint, &remote, RetryPolicy::default()).await?;
     let (send, recv) = conn.open_bi().await?;
 
@@ -34,12 +38,16 @@ pub async fn forward_stdio(secret_key: SecretKey, remote: RemotePath) -> Result<
     Ok(())
 }
 
-pub async fn forward_bindings(secret_key: SecretKey, bindings: Vec<ForwardBinding>) -> Result<()> {
+pub async fn forward_bindings(
+    secret_key: SecretKey,
+    bindings: Vec<ForwardBinding>,
+    mdns_enabled: bool,
+) -> Result<()> {
     if bindings.is_empty() {
         bail!("at least one forward binding is required");
     }
 
-    let endpoint = build_endpoint(secret_key, false).await?;
+    let endpoint = build_endpoint(secret_key, false, mdns_enabled).await?;
 
     let mut prepared = Vec::with_capacity(bindings.len());
     for binding in bindings {

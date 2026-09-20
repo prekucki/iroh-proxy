@@ -50,20 +50,27 @@ pub(crate) fn is_disconnect(err: &std::io::Error) -> bool {
 /// Build an iroh endpoint.
 ///
 /// When `publish` is `true` (server side) the endpoint advertises itself via
-/// DHT/pkarr and mDNS so it is discoverable. When `false` (client/forward side)
-/// it neither publishes to pkarr nor advertises over mDNS.
-pub async fn build_endpoint(secret_key: SecretKey, publish: bool) -> Result<Endpoint> {
+/// DHT/pkarr and, when enabled, mDNS so it is discoverable. When `false`
+/// (client/forward side) it neither publishes to pkarr nor advertises over
+/// mDNS. Setting `mdns_enabled` to `false` avoids creating the mDNS lookup
+/// service at all while leaving DNS, pkarr, and DHT discovery unchanged.
+pub async fn build_endpoint(
+    secret_key: SecretKey,
+    publish: bool,
+    mdns_enabled: bool,
+) -> Result<Endpoint> {
     let dht = DhtAddressLookup::builder();
     let dht = if publish { dht } else { dht.no_publish() };
-    let mdns = MdnsAddressLookup::builder().advertise(publish);
 
     let mut builder = Endpoint::builder(endpoint::presets::Minimal)
         .relay_mode(RelayMode::Default)
         .secret_key(secret_key)
         .address_lookup(PkarrResolver::n0_dns())
         .address_lookup(DnsAddressLookup::n0_dns())
-        .address_lookup(dht)
-        .address_lookup(mdns);
+        .address_lookup(dht);
+    if mdns_enabled {
+        builder = builder.address_lookup(MdnsAddressLookup::builder().advertise(publish));
+    }
     if publish {
         builder = builder.address_lookup(PkarrPublisher::n0_dns());
     }

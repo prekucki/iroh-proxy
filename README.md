@@ -23,7 +23,7 @@ Binary path:
 ## Commands
 
 ```text
-iroh-proxy [--key-file <path>] [--config-file <path>] <command>
+iroh-proxy [--key-file <path>] [--config-file <path>] [--no-mdns] <command>
 ```
 
 ### `server`
@@ -413,6 +413,26 @@ Now local clients can use `127.0.0.1:11435` as if `ollama` were local on the ser
 - local mDNS (LAN discovery)
 - pkarr over the n0 DNS service
 - the Mainline DHT (relay addresses only by default)
+
+Use the global `--no-mdns` flag when multicast DNS is unavailable or unwanted:
+
+```bash
+iroh-proxy --no-mdns server
+iroh-proxy --no-mdns forward <endpoint-id>/tcp/ssh
+```
+
+This completely disables local mDNS discovery and server advertising for that
+process. DNS/pkarr, the Mainline DHT, and relay connectivity remain enabled.
+The default is unchanged: mDNS stays enabled. To persist the setting in an
+installed systemd unit, include the flag while installing it:
+
+```bash
+iroh-proxy --no-mdns server --install
+```
+
+Passing `--no-mdns` to `add-*` or the TUI is also carried into a backend server
+that the command starts. It does not reconfigure a server that is already
+running; restart that server with `--no-mdns` instead.
 
 ## Notes and limits
 

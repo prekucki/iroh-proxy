@@ -27,13 +27,20 @@ use crate::remote_path::RemotePath;
 
 /// Parent side: invoked by ssh. Create a socketpair, spawn a detached child
 /// holding one end, send the other end back to ssh on fd 1, and exit.
-pub fn run_fdpass_parent(remote_arg: &str, key_file: Option<&PathBuf>) -> Result<()> {
+pub fn run_fdpass_parent(
+    remote_arg: &str,
+    key_file: Option<&PathBuf>,
+    mdns_enabled: bool,
+) -> Result<()> {
     let (for_ssh, for_child) = unix_socketpair().context("socketpair failed")?;
 
     let exe = std::env::current_exe().context("failed to resolve current executable path")?;
     let mut cmd = Command::new(exe);
     if let Some(k) = key_file {
         cmd.arg("--key-file").arg(k);
+    }
+    if !mdns_enabled {
+        cmd.arg("--no-mdns");
     }
     cmd.arg("forward")
         .arg("--fdpass-fd")
@@ -86,6 +93,7 @@ pub async fn run_fdpass_child(
     secret_key: SecretKey,
     remote: RemotePath,
     raw_fd: RawFd,
+    mdns_enabled: bool,
 ) -> Result<()> {
     // Take ownership of the inherited fd.
     let std_stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(raw_fd) };
@@ -95,7 +103,7 @@ pub async fn run_fdpass_child(
     let stream = tokio::net::UnixStream::from_std(std_stream)
         .context("failed to register inherited fd with tokio")?;
 
-    let endpoint = build_endpoint(secret_key, false).await?;
+    let endpoint = build_endpoint(secret_key, false, mdns_enabled).await?;
     let conn = connect_remote_with_retry(&endpoint, &remote, RetryPolicy::default()).await?;
     let (send, recv) = conn.open_bi().await?;
 

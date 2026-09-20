@@ -9,6 +9,7 @@ pub fn install_user_service(
     exe_path: &Path,
     key_file: Option<&Path>,
     config_file: &Path,
+    mdns_enabled: bool,
 ) -> Result<PathBuf> {
     let service_path = user_service_path()?;
     if let Some(parent) = service_path.parent() {
@@ -18,7 +19,7 @@ pub fn install_user_service(
 
     let key_file = key_file.map(absolutize_path).transpose()?;
     let config_file = absolutize_path(config_file)?;
-    let unit = render_unit(exe_path, key_file.as_deref(), &config_file);
+    let unit = render_unit(exe_path, key_file.as_deref(), &config_file, mdns_enabled);
     std::fs::write(&service_path, unit).with_context(|| {
         format!(
             "failed to write systemd user service {}",
@@ -37,8 +38,13 @@ fn user_service_path() -> Result<PathBuf> {
         .join(USER_SERVICE_NAME))
 }
 
-fn render_unit(exe_path: &Path, key_file: Option<&Path>, config_file: &Path) -> String {
-    let exec_start = render_exec_start(exe_path, key_file, config_file);
+fn render_unit(
+    exe_path: &Path,
+    key_file: Option<&Path>,
+    config_file: &Path,
+    mdns_enabled: bool,
+) -> String {
+    let exec_start = render_exec_start(exe_path, key_file, config_file, mdns_enabled);
     format!(
         "[Unit]\n\
 Description=iroh-proxy server\n\
@@ -56,7 +62,12 @@ WantedBy=default.target\n"
     )
 }
 
-fn render_exec_start(exe_path: &Path, key_file: Option<&Path>, config_file: &Path) -> String {
+fn render_exec_start(
+    exe_path: &Path,
+    key_file: Option<&Path>,
+    config_file: &Path,
+    mdns_enabled: bool,
+) -> String {
     let mut args = vec![quote_systemd_arg(&exe_path.to_string_lossy())];
     if let Some(key_file) = key_file {
         args.push(quote_systemd_arg("--key-file"));
@@ -64,6 +75,9 @@ fn render_exec_start(exe_path: &Path, key_file: Option<&Path>, config_file: &Pat
     }
     args.push(quote_systemd_arg("--config-file"));
     args.push(quote_systemd_arg(&config_file.to_string_lossy()));
+    if !mdns_enabled {
+        args.push(quote_systemd_arg("--no-mdns"));
+    }
     args.push(quote_systemd_arg("server"));
     args.join(" ")
 }
@@ -87,4 +101,31 @@ fn quote_systemd_arg(raw: &str) -> String {
     }
     out.push('"');
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn render_exec_start_includes_no_mdns_when_disabled() {
+        let exec_start = render_exec_start(
+            Path::new("/usr/bin/iroh-proxy"),
+            None,
+            Path::new("/tmp/config.toml"),
+            false,
+        );
+        assert!(exec_start.contains("\"--no-mdns\""));
+    }
+
+    #[test]
+    fn render_exec_start_omits_no_mdns_by_default() {
+        let exec_start = render_exec_start(
+            Path::new("/usr/bin/iroh-proxy"),
+            None,
+            Path::new("/tmp/config.toml"),
+            true,
+        );
+        assert!(!exec_start.contains("--no-mdns"));
+    }
 }
