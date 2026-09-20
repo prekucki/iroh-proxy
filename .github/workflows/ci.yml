@@ -41,5 +41,7 @@ jobs:
         shell: bash
         run: |
           iroh_manifest=$(cargo metadata --locked --format-version 1 | jq -er '.packages[] | select(.name == "iroh") | .manifest_path')
+          # Cargo returns backslashes on Windows; Bash path trimming needs slashes.
+          iroh_manifest=${iroh_manifest//\\//}
           rustfmt --edition 2024 --check "${iroh_manifest%/*}/src/socket/transports/relay/actor.rs" "${iroh_manifest%/*}/src/socket/transports/relay/recovery_tests.rs"
           cargo test --locked --manifest-path "$iroh_manifest" -p iroh --lib relay_recovery
