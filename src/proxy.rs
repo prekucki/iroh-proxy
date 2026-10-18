@@ -35,6 +35,8 @@ use tracing::{debug, info, warn};
 
 use crate::remote_path::RemotePath;
 
+const ENDPOINT_ONLINE_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// Classifies I/O errors that normally represent an expected stream disconnect
 /// so the connection boundary can choose an appropriate log level.
 pub(crate) fn is_disconnect(err: &std::io::Error) -> bool {
@@ -73,8 +75,19 @@ pub async fn build_endpoint(
         builder = builder.address_lookup(PkarrPublisher::n0_dns());
     }
 
-    let endpoint = builder.bind().await?;
-    endpoint.online().await;
+    let endpoint = builder
+        .bind()
+        .await
+        .context("failed to bind iroh endpoint")?;
+    if tokio::time::timeout(ENDPOINT_ONLINE_TIMEOUT, endpoint.online())
+        .await
+        .is_err()
+    {
+        warn!(
+            timeout_secs = ENDPOINT_ONLINE_TIMEOUT.as_secs(),
+            "relay readiness timed out; continuing with a degraded endpoint while iroh reconnects"
+        );
+    }
     Ok(endpoint)
 }
 
@@ -412,6 +425,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex, split};
     use tokio::net::{TcpListener, TcpStream};
 

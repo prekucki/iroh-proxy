@@ -56,6 +56,18 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo check
 ```
 
+When changing the pinned iroh fork, also run (requires Bash and jq):
+
+```bash
+iroh_manifest=$(cargo metadata --locked --format-version 1 | jq -er '.packages[] | select(.name == "iroh") | .manifest_path')
+cargo test --locked --manifest-path "$iroh_manifest" -p iroh --lib relay_recovery
+```
+
+Keep dependency source changes in the fork, not vendored in this repository.
+Pin all four iroh workspace crates to the same revision; see `docs/relay-recovery.md`.
+Relay recovery must retain the server identity and live service mappings. Tests
+must bound failure waits and clean up all spawned tasks and local test servers.
+
 If behavior changes, update:
 
 - `README.md` usage examples
