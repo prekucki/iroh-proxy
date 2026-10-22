@@ -311,7 +311,10 @@ convention instead of streaming bytes through stdio:
    exits so `ssh`'s `waitpid()` returns and it can use the passed socket.
 
 This avoids the extra hop through the parent process's pipes and hands ssh a
-real kernel socket.
+real kernel socket. The relay inherits only its own socketpair end on fd 3;
+the SSH end and the original duplicate are closed on exec. Closing SSH's
+socket therefore delivers EOF to the relay, allowing forwarding to finish
+once the remote side also closes.
 
 ```sshconfig
 Host gpu-iroh

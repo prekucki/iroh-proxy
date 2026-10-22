@@ -15,9 +15,9 @@
 
 #![cfg(unix)]
 
-use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 
 use anyhow::{Context, Result};
 use iroh::SecretKey;
@@ -46,20 +46,34 @@ pub fn run_fdpass_parent(
         .arg("--fdpass-fd")
         .arg("3")
         .arg(remote_arg);
+    let _child = spawn_relay_child(&mut cmd, &for_child)
+        .context("failed to spawn detached fdpass relay child")?;
+    // The relay outlives this parent; init reaps it after we exit.
+    drop(for_child);
+
+    send_fd(libc::STDOUT_FILENO, for_ssh.as_raw_fd())
+        .context("failed to send connected fd back to ssh via SCM_RIGHTS on stdout")?;
+
+    Ok(())
+}
+
+fn spawn_relay_child(cmd: &mut Command, for_child: &OwnedFd) -> std::io::Result<Child> {
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
 
-    let child_raw = for_child.into_raw_fd();
+    let child_raw = for_child.as_raw_fd();
     unsafe {
         use std::os::unix::process::CommandExt;
         cmd.pre_exec(move || {
             if libc::dup2(child_raw, 3) < 0 {
                 return Err(std::io::Error::last_os_error());
             }
+            // dup2 clears CLOEXEC unless child_raw is already 3. Explicitly
+            // clear it in that case too; all other pair fds close on exec.
             let flags = libc::fcntl(3, libc::F_GETFD);
-            if flags >= 0 {
-                libc::fcntl(3, libc::F_SETFD, flags & !libc::FD_CLOEXEC);
+            if flags < 0 || libc::fcntl(3, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                return Err(std::io::Error::last_os_error());
             }
             if libc::setsid() < 0 {
                 // not fatal: just means we're already a session leader
@@ -68,24 +82,7 @@ pub fn run_fdpass_parent(
         });
     }
 
-    let _child = cmd
-        .spawn()
-        .context("failed to spawn detached fdpass relay child")?;
-    // We intentionally leak the Child handle: once the parent exits, init
-    // reaps the detached relay process.
-    std::mem::forget(_child);
-
-    // Safety: child_raw was dup2'd into the child's fd 3; the duplicate still
-    // lives in *our* process as child_raw. Close it so we don't hold a
-    // spurious reference.
-    unsafe {
-        libc::close(child_raw);
-    }
-
-    send_fd(libc::STDOUT_FILENO, for_ssh.as_raw_fd())
-        .context("failed to send connected fd back to ssh via SCM_RIGHTS on stdout")?;
-
-    Ok(())
+    cmd.spawn()
 }
 
 /// Child side: wrap the passed fd as a Unix stream and forward to iroh.
@@ -116,12 +113,10 @@ pub async fn run_fdpass_child(
 }
 
 fn unix_socketpair() -> std::io::Result<(OwnedFd, OwnedFd)> {
-    let mut fds = [0i32; 2];
-    let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
-    if rc != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
+    // std creates close-on-exec sockets on Unix. Inheriting the SSH end in
+    // the relay would keep its own peer alive forever after SSH exits.
+    let (for_ssh, for_child) = std::os::unix::net::UnixStream::pair()?;
+    Ok((for_ssh.into(), for_child.into()))
 }
 
 /// Send a single file descriptor over an AF_UNIX SOCK_STREAM socket using
@@ -175,4 +170,66 @@ pub fn fdpass_usage_error() -> anyhow::Error {
         "`forward --fdpass` takes exactly one argument: the remote path \
          (<endpoint-id>/tcp/<name>); it cannot be combined with a local listen address"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+    use std::time::{Duration, Instant};
+
+    // Always reap the test process, including on assertion failure or timeout.
+    struct TestChild(Child);
+
+    impl Drop for TestChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[test]
+    fn socketpair_is_close_on_exec() {
+        let (for_ssh, for_child) = unix_socketpair().unwrap();
+        for fd in [&for_ssh, &for_child] {
+            let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
+            assert!(flags >= 0);
+            assert_ne!(flags & libc::FD_CLOEXEC, 0);
+        }
+    }
+
+    #[test]
+    fn relay_observes_eof_when_ssh_closes_socket() {
+        // Like the real CLI's Tokio runtime, occupy low fds first. Otherwise
+        // dup2 into fd 3 can accidentally close the leaked SSH end itself.
+        let _reserved = unix_socketpair().unwrap();
+        let (for_ssh, for_child) = unix_socketpair().unwrap();
+        assert!(for_ssh.as_raw_fd() > 3);
+        assert!(for_child.as_raw_fd() > 3);
+        // Exercise the production fork/exec setup without network discovery.
+        // Only shell builtins are used, so there are no descendant processes.
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c")
+            .arg("printf ready >&3; if IFS= read -r line <&3; then exit 1; fi");
+        let mut child = TestChild(spawn_relay_child(&mut cmd, &for_child).unwrap());
+        drop(for_child);
+
+        let mut ssh = std::os::unix::net::UnixStream::from(for_ssh);
+        ssh.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut ready = [0; 5];
+        ssh.read_exact(&mut ready).unwrap();
+        assert_eq!(&ready, b"ready");
+        // Use close, not shutdown: shutdown would mask an inherited peer fd.
+        drop(ssh);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                assert!(status.success(), "relay exited with {status}");
+                break;
+            }
+            assert!(Instant::now() < deadline, "relay did not observe SSH EOF");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
 }
