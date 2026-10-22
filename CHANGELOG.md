@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.5
+
+- Fix SSH `--fdpass` relays hanging after SSH closes its socket by preventing socket descriptor inheritance across exec.
+- Add global `--no-mdns` to disable local mDNS discovery while retaining other discovery methods; propagate it to relay children and generated systemd services.
+
 ## 0.2.4
 
 - Recover unresponsive relay actors without restarting the proxy, preserving the endpoint identity and service mappings.
